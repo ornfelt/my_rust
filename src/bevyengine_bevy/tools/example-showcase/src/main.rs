@@ -284,7 +284,7 @@ fn main() {
 
             let reports_path = "example-showcase-reports";
             if report_details {
-                std::fs::create_dir(reports_path)
+                fs::create_dir(reports_path)
                     .expect("Failed to create example-showcase-reports directory");
             }
 
@@ -823,8 +823,8 @@ struct Example {
     description: String,
     /// Pretty category name, matching the folder containing the example
     category: String,
-    /// Does this example work in wasm?
-    // TODO: be able to differentiate between WebGL2, WebGPU, both, or neither (for examples that could run on wasm without a renderer)
+    /// Does this example work in Wasm?
+    // TODO: be able to differentiate between WebGL2, WebGPU, both, or neither (for examples that could run on Wasm without a renderer)
     wasm: bool,
     /// List of commands to run before the example. Can be used for example to specify data to download
     setup: Vec<Vec<String>>,

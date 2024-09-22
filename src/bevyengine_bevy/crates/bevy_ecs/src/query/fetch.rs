@@ -1,17 +1,19 @@
 use crate::{
     archetype::{Archetype, Archetypes},
-    change_detection::{Ticks, TicksMut},
+    bundle::Bundle,
+    change_detection::{MaybeThinSlicePtrLocation, Ticks, TicksMut},
     component::{Component, ComponentId, Components, StorageType, Tick},
     entity::{Entities, Entity, EntityLocation},
     query::{Access, DebugCheckedUnwrap, FilteredAccess, WorldQuery},
     storage::{ComponentSparseSet, Table, TableRow},
     world::{
-        unsafe_world_cell::UnsafeWorldCell, EntityMut, EntityRef, FilteredEntityMut,
-        FilteredEntityRef, Mut, Ref, World,
+        unsafe_world_cell::UnsafeWorldCell, EntityMut, EntityMutExcept, EntityRef, EntityRefExcept,
+        FilteredEntityMut, FilteredEntityRef, Mut, Ref, World,
     },
 };
 use bevy_ptr::{ThinSlicePtr, UnsafeCellDeref};
 use bevy_utils::all_tuples;
+use smallvec::SmallVec;
 use std::{cell::UnsafeCell, marker::PhantomData};
 
 /// Types that can be fetched from a [`World`] using a [`Query`].
@@ -301,6 +303,8 @@ unsafe impl WorldQuery for Entity {
         item
     }
 
+    fn shrink_fetch<'wlong: 'wshort, 'wshort>(_: Self::Fetch<'wlong>) -> Self::Fetch<'wshort> {}
+
     unsafe fn init_fetch<'w>(
         _world: UnsafeWorldCell<'w>,
         _state: &Self::State,
@@ -367,6 +371,10 @@ unsafe impl WorldQuery for EntityLocation {
 
     fn shrink<'wlong: 'wshort, 'wshort>(item: Self::Item<'wlong>) -> Self::Item<'wshort> {
         item
+    }
+
+    fn shrink_fetch<'wlong: 'wshort, 'wshort>(fetch: Self::Fetch<'wlong>) -> Self::Fetch<'wshort> {
+        fetch
     }
 
     unsafe fn init_fetch<'w>(
@@ -442,6 +450,10 @@ unsafe impl<'a> WorldQuery for EntityRef<'a> {
         item
     }
 
+    fn shrink_fetch<'wlong: 'wshort, 'wshort>(fetch: Self::Fetch<'wlong>) -> Self::Fetch<'wshort> {
+        fetch
+    }
+
     unsafe fn init_fetch<'w>(
         world: UnsafeWorldCell<'w>,
         _state: &Self::State,
@@ -480,10 +492,10 @@ unsafe impl<'a> WorldQuery for EntityRef<'a> {
 
     fn update_component_access(_state: &Self::State, access: &mut FilteredAccess<ComponentId>) {
         assert!(
-            !access.access().has_any_write(),
+            !access.access().has_any_component_write(),
             "EntityRef conflicts with a previous access in this query. Shared access cannot coincide with exclusive access.",
         );
-        access.read_all();
+        access.read_all_components();
     }
 
     fn init_state(_world: &mut World) {}
@@ -516,6 +528,10 @@ unsafe impl<'a> WorldQuery for EntityMut<'a> {
 
     fn shrink<'wlong: 'wshort, 'wshort>(item: Self::Item<'wlong>) -> Self::Item<'wshort> {
         item
+    }
+
+    fn shrink_fetch<'wlong: 'wshort, 'wshort>(fetch: Self::Fetch<'wlong>) -> Self::Fetch<'wshort> {
+        fetch
     }
 
     unsafe fn init_fetch<'w>(
@@ -556,10 +572,10 @@ unsafe impl<'a> WorldQuery for EntityMut<'a> {
 
     fn update_component_access(_state: &Self::State, access: &mut FilteredAccess<ComponentId>) {
         assert!(
-            !access.access().has_any_read(),
+            !access.access().has_any_component_read(),
             "EntityMut conflicts with a previous access in this query. Exclusive access cannot coincide with any other accesses.",
         );
-        access.write_all();
+        access.write_all_components();
     }
 
     fn init_state(_world: &mut World) {}
@@ -591,6 +607,10 @@ unsafe impl<'a> WorldQuery for FilteredEntityRef<'a> {
         item
     }
 
+    fn shrink_fetch<'wlong: 'wshort, 'wshort>(fetch: Self::Fetch<'wlong>) -> Self::Fetch<'wshort> {
+        fetch
+    }
+
     const IS_DENSE: bool = false;
 
     unsafe fn init_fetch<'w>(
@@ -600,7 +620,7 @@ unsafe impl<'a> WorldQuery for FilteredEntityRef<'a> {
         _this_run: Tick,
     ) -> Self::Fetch<'w> {
         let mut access = Access::default();
-        access.read_all();
+        access.read_all_components();
         (world, access)
     }
 
@@ -608,32 +628,20 @@ unsafe impl<'a> WorldQuery for FilteredEntityRef<'a> {
     unsafe fn set_archetype<'w>(
         fetch: &mut Self::Fetch<'w>,
         state: &Self::State,
-        archetype: &'w Archetype,
+        _: &'w Archetype,
         _table: &Table,
     ) {
-        let mut access = Access::default();
-        state.access.reads().for_each(|id| {
-            if archetype.contains(id) {
-                access.add_read(id);
-            }
-        });
-        fetch.1 = access;
+        fetch.1.clone_from(&state.access);
     }
 
     #[inline]
-    unsafe fn set_table<'w>(fetch: &mut Self::Fetch<'w>, state: &Self::State, table: &'w Table) {
-        let mut access = Access::default();
-        state.access.reads().for_each(|id| {
-            if table.has_column(id) {
-                access.add_read(id);
-            }
-        });
-        fetch.1 = access;
+    unsafe fn set_table<'w>(fetch: &mut Self::Fetch<'w>, state: &Self::State, _: &'w Table) {
+        fetch.1.clone_from(&state.access);
     }
 
     #[inline]
     fn set_access<'w>(state: &mut Self::State, access: &FilteredAccess<ComponentId>) {
-        *state = access.clone();
+        state.clone_from(access);
         state.access_mut().clear_writes();
     }
 
@@ -694,6 +702,10 @@ unsafe impl<'a> WorldQuery for FilteredEntityMut<'a> {
         item
     }
 
+    fn shrink_fetch<'wlong: 'wshort, 'wshort>(fetch: Self::Fetch<'wlong>) -> Self::Fetch<'wshort> {
+        fetch
+    }
+
     const IS_DENSE: bool = false;
 
     unsafe fn init_fetch<'w>(
@@ -703,7 +715,7 @@ unsafe impl<'a> WorldQuery for FilteredEntityMut<'a> {
         _this_run: Tick,
     ) -> Self::Fetch<'w> {
         let mut access = Access::default();
-        access.write_all();
+        access.write_all_components();
         (world, access)
     }
 
@@ -711,42 +723,20 @@ unsafe impl<'a> WorldQuery for FilteredEntityMut<'a> {
     unsafe fn set_archetype<'w>(
         fetch: &mut Self::Fetch<'w>,
         state: &Self::State,
-        archetype: &'w Archetype,
+        _: &'w Archetype,
         _table: &Table,
     ) {
-        let mut access = Access::default();
-        state.access.reads().for_each(|id| {
-            if archetype.contains(id) {
-                access.add_read(id);
-            }
-        });
-        state.access.writes().for_each(|id| {
-            if archetype.contains(id) {
-                access.add_write(id);
-            }
-        });
-        fetch.1 = access;
+        fetch.1.clone_from(&state.access);
     }
 
     #[inline]
-    unsafe fn set_table<'w>(fetch: &mut Self::Fetch<'w>, state: &Self::State, table: &'w Table) {
-        let mut access = Access::default();
-        state.access.reads().for_each(|id| {
-            if table.has_column(id) {
-                access.add_read(id);
-            }
-        });
-        state.access.writes().for_each(|id| {
-            if table.has_column(id) {
-                access.add_write(id);
-            }
-        });
-        fetch.1 = access;
+    unsafe fn set_table<'w>(fetch: &mut Self::Fetch<'w>, state: &Self::State, _: &'w Table) {
+        fetch.1.clone_from(&state.access);
     }
 
     #[inline]
     fn set_access<'w>(state: &mut Self::State, access: &FilteredAccess<ComponentId>) {
-        *state = access.clone();
+        state.clone_from(access);
     }
 
     #[inline(always)]
@@ -793,6 +783,201 @@ unsafe impl<'a> QueryData for FilteredEntityMut<'a> {
     type ReadOnly = FilteredEntityRef<'a>;
 }
 
+/// SAFETY: `EntityRefExcept` guards access to all components in the bundle `B`
+/// and populates `Access` values so that queries that conflict with this access
+/// are rejected.
+unsafe impl<'a, B> WorldQuery for EntityRefExcept<'a, B>
+where
+    B: Bundle,
+{
+    type Fetch<'w> = UnsafeWorldCell<'w>;
+    type Item<'w> = EntityRefExcept<'w, B>;
+    type State = SmallVec<[ComponentId; 4]>;
+
+    fn shrink<'wlong: 'wshort, 'wshort>(item: Self::Item<'wlong>) -> Self::Item<'wshort> {
+        item
+    }
+
+    fn shrink_fetch<'wlong: 'wshort, 'wshort>(fetch: Self::Fetch<'wlong>) -> Self::Fetch<'wshort> {
+        fetch
+    }
+
+    unsafe fn init_fetch<'w>(
+        world: UnsafeWorldCell<'w>,
+        _: &Self::State,
+        _: Tick,
+        _: Tick,
+    ) -> Self::Fetch<'w> {
+        world
+    }
+
+    const IS_DENSE: bool = true;
+
+    unsafe fn set_archetype<'w>(
+        _: &mut Self::Fetch<'w>,
+        _: &Self::State,
+        _: &'w Archetype,
+        _: &'w Table,
+    ) {
+    }
+
+    unsafe fn set_table<'w>(_: &mut Self::Fetch<'w>, _: &Self::State, _: &'w Table) {}
+
+    unsafe fn fetch<'w>(
+        world: &mut Self::Fetch<'w>,
+        entity: Entity,
+        _: TableRow,
+    ) -> Self::Item<'w> {
+        let cell = world.get_entity(entity).unwrap();
+        EntityRefExcept::new(cell)
+    }
+
+    fn update_component_access(
+        state: &Self::State,
+        filtered_access: &mut FilteredAccess<ComponentId>,
+    ) {
+        let mut my_access = Access::new();
+        my_access.read_all_components();
+        for id in state {
+            my_access.remove_component_read(*id);
+        }
+
+        let access = filtered_access.access_mut();
+        assert!(
+            access.is_compatible(&my_access),
+            "`EntityRefExcept<{}>` conflicts with a previous access in this query.",
+            std::any::type_name::<B>(),
+        );
+        access.extend(&my_access);
+    }
+
+    fn init_state(world: &mut World) -> Self::State {
+        Self::get_state(world.components()).unwrap()
+    }
+
+    fn get_state(components: &Components) -> Option<Self::State> {
+        let mut ids = SmallVec::new();
+        B::get_component_ids(components, &mut |maybe_id| {
+            if let Some(id) = maybe_id {
+                ids.push(id);
+            }
+        });
+        Some(ids)
+    }
+
+    fn matches_component_set(_: &Self::State, _: &impl Fn(ComponentId) -> bool) -> bool {
+        true
+    }
+}
+
+/// SAFETY: `Self` is the same as `Self::ReadOnly`.
+unsafe impl<'a, B> QueryData for EntityRefExcept<'a, B>
+where
+    B: Bundle,
+{
+    type ReadOnly = Self;
+}
+
+/// SAFETY: `EntityRefExcept` enforces read-only access to its contained
+/// components.
+unsafe impl<'a, B> ReadOnlyQueryData for EntityRefExcept<'a, B> where B: Bundle {}
+
+/// SAFETY: `EntityMutExcept` guards access to all components in the bundle `B`
+/// and populates `Access` values so that queries that conflict with this access
+/// are rejected.
+unsafe impl<'a, B> WorldQuery for EntityMutExcept<'a, B>
+where
+    B: Bundle,
+{
+    type Fetch<'w> = UnsafeWorldCell<'w>;
+    type Item<'w> = EntityMutExcept<'w, B>;
+    type State = SmallVec<[ComponentId; 4]>;
+
+    fn shrink<'wlong: 'wshort, 'wshort>(item: Self::Item<'wlong>) -> Self::Item<'wshort> {
+        item
+    }
+
+    fn shrink_fetch<'wlong: 'wshort, 'wshort>(fetch: Self::Fetch<'wlong>) -> Self::Fetch<'wshort> {
+        fetch
+    }
+
+    unsafe fn init_fetch<'w>(
+        world: UnsafeWorldCell<'w>,
+        _: &Self::State,
+        _: Tick,
+        _: Tick,
+    ) -> Self::Fetch<'w> {
+        world
+    }
+
+    const IS_DENSE: bool = true;
+
+    unsafe fn set_archetype<'w>(
+        _: &mut Self::Fetch<'w>,
+        _: &Self::State,
+        _: &'w Archetype,
+        _: &'w Table,
+    ) {
+    }
+
+    unsafe fn set_table<'w>(_: &mut Self::Fetch<'w>, _: &Self::State, _: &'w Table) {}
+
+    unsafe fn fetch<'w>(
+        world: &mut Self::Fetch<'w>,
+        entity: Entity,
+        _: TableRow,
+    ) -> Self::Item<'w> {
+        let cell = world.get_entity(entity).unwrap();
+        EntityMutExcept::new(cell)
+    }
+
+    fn update_component_access(
+        state: &Self::State,
+        filtered_access: &mut FilteredAccess<ComponentId>,
+    ) {
+        let mut my_access = Access::new();
+        my_access.write_all_components();
+        for id in state {
+            my_access.remove_component_read(*id);
+        }
+
+        let access = filtered_access.access_mut();
+        assert!(
+            access.is_compatible(&my_access),
+            "`EntityMutExcept<{}>` conflicts with a previous access in this query.",
+            std::any::type_name::<B>()
+        );
+        access.extend(&my_access);
+    }
+
+    fn init_state(world: &mut World) -> Self::State {
+        Self::get_state(world.components()).unwrap()
+    }
+
+    fn get_state(components: &Components) -> Option<Self::State> {
+        let mut ids = SmallVec::new();
+        B::get_component_ids(components, &mut |maybe_id| {
+            if let Some(id) = maybe_id {
+                ids.push(id);
+            }
+        });
+        Some(ids)
+    }
+
+    fn matches_component_set(_: &Self::State, _: &impl Fn(ComponentId) -> bool) -> bool {
+        true
+    }
+}
+
+/// SAFETY: All accesses that `EntityRefExcept` provides are also accesses that
+/// `EntityMutExcept` provides.
+unsafe impl<'a, B> QueryData for EntityMutExcept<'a, B>
+where
+    B: Bundle,
+{
+    type ReadOnly = EntityRefExcept<'a, B>;
+}
+
 /// SAFETY:
 /// `update_component_access` and `update_archetype_component_access` do nothing.
 /// This is sound because `fetch` does not access components.
@@ -803,6 +988,10 @@ unsafe impl WorldQuery for &Archetype {
 
     fn shrink<'wlong: 'wshort, 'wshort>(item: Self::Item<'wlong>) -> Self::Item<'wshort> {
         item
+    }
+
+    fn shrink_fetch<'wlong: 'wshort, 'wshort>(fetch: Self::Fetch<'wlong>) -> Self::Fetch<'wshort> {
+        fetch
     }
 
     unsafe fn init_fetch<'w>(
@@ -897,6 +1086,10 @@ unsafe impl<T: Component> WorldQuery for &T {
         item
     }
 
+    fn shrink_fetch<'wlong: 'wshort, 'wshort>(fetch: Self::Fetch<'wlong>) -> Self::Fetch<'wshort> {
+        fetch
+    }
+
     #[inline]
     unsafe fn init_fetch<'w>(
         world: UnsafeWorldCell<'w>,
@@ -952,9 +1145,8 @@ unsafe impl<T: Component> WorldQuery for &T {
     ) {
         fetch.table_components = Some(
             table
-                .get_column(component_id)
+                .get_data_slice_for(component_id)
                 .debug_checked_unwrap()
-                .get_data_slice()
                 .into(),
         );
     }
@@ -988,11 +1180,11 @@ unsafe impl<T: Component> WorldQuery for &T {
         access: &mut FilteredAccess<ComponentId>,
     ) {
         assert!(
-            !access.access().has_write(component_id),
+            !access.access().has_component_write(component_id),
             "&{} conflicts with a previous access in this query. Shared access cannot coincide with exclusive access.",
-                std::any::type_name::<T>(),
+            std::any::type_name::<T>(),
         );
-        access.add_read(component_id);
+        access.add_component_read(component_id);
     }
 
     fn init_state(world: &mut World) -> ComponentId {
@@ -1026,6 +1218,7 @@ pub struct RefFetch<'w, T> {
         ThinSlicePtr<'w, UnsafeCell<T>>,
         ThinSlicePtr<'w, UnsafeCell<Tick>>,
         ThinSlicePtr<'w, UnsafeCell<Tick>>,
+        MaybeThinSlicePtrLocation<'w>,
     )>,
     // T::STORAGE_TYPE = StorageType::SparseSet
     sparse_set: Option<&'w ComponentSparseSet>,
@@ -1053,6 +1246,10 @@ unsafe impl<'__w, T: Component> WorldQuery for Ref<'__w, T> {
 
     fn shrink<'wlong: 'wshort, 'wshort>(item: Ref<'wlong, T>) -> Ref<'wshort, T> {
         item
+    }
+
+    fn shrink_fetch<'wlong: 'wshort, 'wshort>(fetch: Self::Fetch<'wlong>) -> Self::Fetch<'wshort> {
+        fetch
     }
 
     #[inline]
@@ -1112,9 +1309,13 @@ unsafe impl<'__w, T: Component> WorldQuery for Ref<'__w, T> {
     ) {
         let column = table.get_column(component_id).debug_checked_unwrap();
         fetch.table_data = Some((
-            column.get_data_slice().into(),
-            column.get_added_ticks_slice().into(),
-            column.get_changed_ticks_slice().into(),
+            column.get_data_slice(table.entity_count()).into(),
+            column.get_added_ticks_slice(table.entity_count()).into(),
+            column.get_changed_ticks_slice(table.entity_count()).into(),
+            #[cfg(feature = "track_change_detection")]
+            column.get_changed_by_slice(table.entity_count()).into(),
+            #[cfg(not(feature = "track_change_detection"))]
+            (),
         ));
     }
 
@@ -1127,7 +1328,7 @@ unsafe impl<'__w, T: Component> WorldQuery for Ref<'__w, T> {
         match T::STORAGE_TYPE {
             StorageType::Table => {
                 // SAFETY: STORAGE_TYPE = Table
-                let (table_components, added_ticks, changed_ticks) =
+                let (table_components, added_ticks, changed_ticks, _callers) =
                     unsafe { fetch.table_data.debug_checked_unwrap() };
 
                 // SAFETY: The caller ensures `table_row` is in range.
@@ -1136,6 +1337,9 @@ unsafe impl<'__w, T: Component> WorldQuery for Ref<'__w, T> {
                 let added = unsafe { added_ticks.get(table_row.as_usize()) };
                 // SAFETY: The caller ensures `table_row` is in range.
                 let changed = unsafe { changed_ticks.get(table_row.as_usize()) };
+                // SAFETY: The caller ensures `table_row` is in range.
+                #[cfg(feature = "track_change_detection")]
+                let caller = unsafe { _callers.get(table_row.as_usize()) };
 
                 Ref {
                     value: component.deref(),
@@ -1145,6 +1349,8 @@ unsafe impl<'__w, T: Component> WorldQuery for Ref<'__w, T> {
                         this_run: fetch.this_run,
                         last_run: fetch.last_run,
                     },
+                    #[cfg(feature = "track_change_detection")]
+                    changed_by: caller.deref(),
                 }
             }
             StorageType::SparseSet => {
@@ -1152,7 +1358,7 @@ unsafe impl<'__w, T: Component> WorldQuery for Ref<'__w, T> {
                 let component_sparse_set = unsafe { fetch.sparse_set.debug_checked_unwrap() };
 
                 // SAFETY: The caller ensures `entity` is in range.
-                let (component, ticks) = unsafe {
+                let (component, ticks, _caller) = unsafe {
                     component_sparse_set
                         .get_with_ticks(entity)
                         .debug_checked_unwrap()
@@ -1161,6 +1367,8 @@ unsafe impl<'__w, T: Component> WorldQuery for Ref<'__w, T> {
                 Ref {
                     value: component.deref(),
                     ticks: Ticks::from_tick_cells(ticks, fetch.last_run, fetch.this_run),
+                    #[cfg(feature = "track_change_detection")]
+                    changed_by: _caller.deref(),
                 }
             }
         }
@@ -1171,11 +1379,11 @@ unsafe impl<'__w, T: Component> WorldQuery for Ref<'__w, T> {
         access: &mut FilteredAccess<ComponentId>,
     ) {
         assert!(
-            !access.access().has_write(component_id),
+            !access.access().has_component_write(component_id),
             "&{} conflicts with a previous access in this query. Shared access cannot coincide with exclusive access.",
-                std::any::type_name::<T>(),
+            std::any::type_name::<T>(),
         );
-        access.add_read(component_id);
+        access.add_component_read(component_id);
     }
 
     fn init_state(world: &mut World) -> ComponentId {
@@ -1209,6 +1417,7 @@ pub struct WriteFetch<'w, T> {
         ThinSlicePtr<'w, UnsafeCell<T>>,
         ThinSlicePtr<'w, UnsafeCell<Tick>>,
         ThinSlicePtr<'w, UnsafeCell<Tick>>,
+        MaybeThinSlicePtrLocation<'w>,
     )>,
     // T::STORAGE_TYPE = StorageType::SparseSet
     sparse_set: Option<&'w ComponentSparseSet>,
@@ -1236,6 +1445,10 @@ unsafe impl<'__w, T: Component> WorldQuery for &'__w mut T {
 
     fn shrink<'wlong: 'wshort, 'wshort>(item: Mut<'wlong, T>) -> Mut<'wshort, T> {
         item
+    }
+
+    fn shrink_fetch<'wlong: 'wshort, 'wshort>(fetch: Self::Fetch<'wlong>) -> Self::Fetch<'wshort> {
+        fetch
     }
 
     #[inline]
@@ -1295,9 +1508,13 @@ unsafe impl<'__w, T: Component> WorldQuery for &'__w mut T {
     ) {
         let column = table.get_column(component_id).debug_checked_unwrap();
         fetch.table_data = Some((
-            column.get_data_slice().into(),
-            column.get_added_ticks_slice().into(),
-            column.get_changed_ticks_slice().into(),
+            column.get_data_slice(table.entity_count()).into(),
+            column.get_added_ticks_slice(table.entity_count()).into(),
+            column.get_changed_ticks_slice(table.entity_count()).into(),
+            #[cfg(feature = "track_change_detection")]
+            column.get_changed_by_slice(table.entity_count()).into(),
+            #[cfg(not(feature = "track_change_detection"))]
+            (),
         ));
     }
 
@@ -1310,7 +1527,7 @@ unsafe impl<'__w, T: Component> WorldQuery for &'__w mut T {
         match T::STORAGE_TYPE {
             StorageType::Table => {
                 // SAFETY: STORAGE_TYPE = Table
-                let (table_components, added_ticks, changed_ticks) =
+                let (table_components, added_ticks, changed_ticks, _callers) =
                     unsafe { fetch.table_data.debug_checked_unwrap() };
 
                 // SAFETY: The caller ensures `table_row` is in range.
@@ -1319,6 +1536,9 @@ unsafe impl<'__w, T: Component> WorldQuery for &'__w mut T {
                 let added = unsafe { added_ticks.get(table_row.as_usize()) };
                 // SAFETY: The caller ensures `table_row` is in range.
                 let changed = unsafe { changed_ticks.get(table_row.as_usize()) };
+                // SAFETY: The caller ensures `table_row` is in range.
+                #[cfg(feature = "track_change_detection")]
+                let caller = unsafe { _callers.get(table_row.as_usize()) };
 
                 Mut {
                     value: component.deref_mut(),
@@ -1328,6 +1548,8 @@ unsafe impl<'__w, T: Component> WorldQuery for &'__w mut T {
                         this_run: fetch.this_run,
                         last_run: fetch.last_run,
                     },
+                    #[cfg(feature = "track_change_detection")]
+                    changed_by: caller.deref_mut(),
                 }
             }
             StorageType::SparseSet => {
@@ -1335,7 +1557,7 @@ unsafe impl<'__w, T: Component> WorldQuery for &'__w mut T {
                 let component_sparse_set = unsafe { fetch.sparse_set.debug_checked_unwrap() };
 
                 // SAFETY: The caller ensures `entity` is in range.
-                let (component, ticks) = unsafe {
+                let (component, ticks, _caller) = unsafe {
                     component_sparse_set
                         .get_with_ticks(entity)
                         .debug_checked_unwrap()
@@ -1344,6 +1566,8 @@ unsafe impl<'__w, T: Component> WorldQuery for &'__w mut T {
                 Mut {
                     value: component.assert_unique().deref_mut(),
                     ticks: TicksMut::from_tick_cells(ticks, fetch.last_run, fetch.this_run),
+                    #[cfg(feature = "track_change_detection")]
+                    changed_by: _caller.deref_mut(),
                 }
             }
         }
@@ -1354,11 +1578,11 @@ unsafe impl<'__w, T: Component> WorldQuery for &'__w mut T {
         access: &mut FilteredAccess<ComponentId>,
     ) {
         assert!(
-            !access.access().has_read(component_id),
+            !access.access().has_component_read(component_id),
             "&mut {} conflicts with a previous access in this query. Mutable component access must be unique.",
-                std::any::type_name::<T>(),
+            std::any::type_name::<T>(),
         );
-        access.add_write(component_id);
+        access.add_component_write(component_id);
     }
 
     fn init_state(world: &mut World) -> ComponentId {
@@ -1399,6 +1623,10 @@ unsafe impl<'__w, T: Component> WorldQuery for Mut<'__w, T> {
     // Forwarded to `&mut T`
     fn shrink<'wlong: 'wshort, 'wshort>(item: Mut<'wlong, T>) -> Mut<'wshort, T> {
         <&mut T as WorldQuery>::shrink(item)
+    }
+
+    fn shrink_fetch<'wlong: 'wshort, 'wshort>(fetch: Self::Fetch<'wlong>) -> Self::Fetch<'wshort> {
+        fetch
     }
 
     #[inline]
@@ -1452,11 +1680,11 @@ unsafe impl<'__w, T: Component> WorldQuery for Mut<'__w, T> {
         // Update component access here instead of in `<&mut T as WorldQuery>` to avoid erroneously referencing
         // `&mut T` in error message.
         assert!(
-            !access.access().has_read(component_id),
+            !access.access().has_component_read(component_id),
             "Mut<{}> conflicts with a previous access in this query. Mutable component access mut be unique.",
-                std::any::type_name::<T>(),
+            std::any::type_name::<T>(),
         );
-        access.add_write(component_id);
+        access.add_component_write(component_id);
     }
 
     // Forwarded to `&mut T`
@@ -1509,6 +1737,13 @@ unsafe impl<T: WorldQuery> WorldQuery for Option<T> {
 
     fn shrink<'wlong: 'wshort, 'wshort>(item: Self::Item<'wlong>) -> Self::Item<'wshort> {
         item.map(T::shrink)
+    }
+
+    fn shrink_fetch<'wlong: 'wshort, 'wshort>(fetch: Self::Fetch<'wlong>) -> Self::Fetch<'wshort> {
+        OptionFetch {
+            fetch: T::shrink_fetch(fetch.fetch),
+            matches: fetch.matches,
+        }
     }
 
     #[inline]
@@ -1688,6 +1923,10 @@ unsafe impl<T: Component> WorldQuery for Has<T> {
         item
     }
 
+    fn shrink_fetch<'wlong: 'wshort, 'wshort>(fetch: Self::Fetch<'wlong>) -> Self::Fetch<'wshort> {
+        fetch
+    }
+
     #[inline]
     unsafe fn init_fetch<'w>(
         _world: UnsafeWorldCell<'w>,
@@ -1769,10 +2008,11 @@ unsafe impl<T: Component> ReadOnlyQueryData for Has<T> {}
 pub struct AnyOf<T>(PhantomData<T>);
 
 macro_rules! impl_tuple_query_data {
-    ($(($name: ident, $state: ident)),*) => {
+    ($(#[$meta:meta])* $(($name: ident, $state: ident)),*) => {
 
         #[allow(non_snake_case)]
         #[allow(clippy::unused_unit)]
+        $(#[$meta])*
         // SAFETY: defers to soundness `$name: WorldQuery` impl
         unsafe impl<$($name: QueryData),*> QueryData for ($($name,)*) {
             type ReadOnly = ($($name::ReadOnly,)*);
@@ -1803,6 +2043,12 @@ macro_rules! impl_anytuple_fetch {
                 let ($($name,)*) = item;
                 ($(
                     $name.map($name::shrink),
+                )*)
+            }
+            fn shrink_fetch<'wlong: 'wshort, 'wshort>(fetch: Self::Fetch<'wlong>) -> Self::Fetch<'wshort> {
+                let ($($name,)*) = fetch;
+                ($(
+                    ($name::shrink_fetch($name.0), $name.1),
                 )*)
             }
 
@@ -1914,7 +2160,14 @@ macro_rules! impl_anytuple_fetch {
     };
 }
 
-all_tuples!(impl_tuple_query_data, 0, 15, F, S);
+all_tuples!(
+    #[doc(fake_variadic)]
+    impl_tuple_query_data,
+    0,
+    15,
+    F,
+    S
+);
 all_tuples!(impl_anytuple_fetch, 0, 15, F, S);
 
 /// [`WorldQuery`] used to nullify queries by turning `Query<D>` into `Query<NopWorldQuery<D>>`
@@ -1931,6 +2184,8 @@ unsafe impl<D: QueryData> WorldQuery for NopWorldQuery<D> {
     type State = D::State;
 
     fn shrink<'wlong: 'wshort, 'wshort>(_: ()) {}
+
+    fn shrink_fetch<'wlong: 'wshort, 'wshort>(_: ()) {}
 
     #[inline(always)]
     unsafe fn init_fetch(
@@ -1999,6 +2254,9 @@ unsafe impl<T: ?Sized> WorldQuery for PhantomData<T> {
     type State = ();
 
     fn shrink<'wlong: 'wshort, 'wshort>(_item: Self::Item<'wlong>) -> Self::Item<'wshort> {}
+
+    fn shrink_fetch<'wlong: 'wshort, 'wshort>(_fetch: Self::Fetch<'wlong>) -> Self::Fetch<'wshort> {
+    }
 
     unsafe fn init_fetch<'w>(
         _world: UnsafeWorldCell<'w>,

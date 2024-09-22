@@ -120,16 +120,6 @@ impl Plugin for PlaceholderPlugin {
     fn build(&self, _app: &mut App) {}
 }
 
-/// A type representing an unsafe function that returns a mutable pointer to a [`Plugin`].
-/// It is used for dynamically loading plugins.
-///
-/// See `bevy_dynamic_plugin/src/loader.rs#dynamically_load_plugin`.
-#[deprecated(
-    since = "0.14.0",
-    note = "The current dynamic plugin system is unsound and will be removed in 0.15."
-)]
-pub type CreatePlugin = unsafe fn() -> *mut dyn Plugin;
-
 /// Types that represent a set of [`Plugin`]s.
 ///
 /// This is implemented for all types which implement [`Plugin`],
@@ -177,7 +167,9 @@ mod sealed {
             where
                 $($plugins: Plugins<$param>),*
             {
-                #[allow(non_snake_case, unused_variables)]
+                // We use `allow` instead of `expect` here because the lint is not generated for all cases.
+                #[allow(non_snake_case, reason = "`all_tuples!()` generates non-snake-case variable names.")]
+                #[allow(unused_variables, reason = "`app` is unused when implemented for the unit type `()`.")]
                 #[track_caller]
                 fn add_to_app(self, app: &mut App) {
                     let ($($plugins,)*) = self;

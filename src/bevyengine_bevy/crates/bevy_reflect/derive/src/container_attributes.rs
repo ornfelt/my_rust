@@ -5,10 +5,9 @@
 //! the derive helper attribute for `Reflect`, which looks like:
 //! `#[reflect(PartialEq, Default, ...)]` and `#[reflect_value(PartialEq, Default, ...)]`.
 
+use crate::attribute_parser::terminated_parser;
 use crate::custom_attributes::CustomAttributes;
 use crate::derive_data::ReflectTraitToImpl;
-use crate::utility;
-use crate::utility::terminated_parser;
 use bevy_macro_utils::fq_std::{FQAny, FQOption};
 use proc_macro2::{Ident, Span};
 use quote::quote_spanned;
@@ -268,7 +267,7 @@ impl ContainerAttributes {
         let ident_name = ident.to_string();
 
         // Create the reflect ident
-        let mut reflect_ident = utility::get_reflect_ident(&ident_name);
+        let mut reflect_ident = crate::ident::get_reflect_ident(&ident_name);
         // We set the span to the old ident so any compile errors point to that ident instead
         reflect_ident.set_span(ident.span());
 
@@ -434,7 +433,10 @@ impl ContainerAttributes {
     }
 
     /// The `FromReflect` configuration found within `#[reflect(...)]` attributes on this type.
-    #[allow(clippy::wrong_self_convention)]
+    #[expect(
+        clippy::wrong_self_convention,
+        reason = "Method returns `FromReflectAttrs`, does not actually convert data."
+    )]
     pub fn from_reflect_attrs(&self) -> &FromReflectAttrs {
         &self.from_reflect_attrs
     }
@@ -444,7 +446,7 @@ impl ContainerAttributes {
         &self.type_path_attrs
     }
 
-    /// Returns the implementation of `Reflect::reflect_hash` as a `TokenStream`.
+    /// Returns the implementation of `PartialReflect::reflect_hash` as a `TokenStream`.
     ///
     /// If `Hash` was not registered, returns `None`.
     pub fn get_hash_impl(&self, bevy_reflect_path: &Path) -> Option<proc_macro2::TokenStream> {
@@ -467,7 +469,7 @@ impl ContainerAttributes {
         }
     }
 
-    /// Returns the implementation of `Reflect::reflect_partial_eq` as a `TokenStream`.
+    /// Returns the implementation of `PartialReflect::reflect_partial_eq` as a `TokenStream`.
     ///
     /// If `PartialEq` was not registered, returns `None`.
     pub fn get_partial_eq_impl(
@@ -476,9 +478,9 @@ impl ContainerAttributes {
     ) -> Option<proc_macro2::TokenStream> {
         match &self.partial_eq {
             &TraitImpl::Implemented(span) => Some(quote_spanned! {span=>
-                fn reflect_partial_eq(&self, value: &dyn #bevy_reflect_path::Reflect) -> #FQOption<bool> {
-                    let value = <dyn #bevy_reflect_path::Reflect>::as_any(value);
-                    if let #FQOption::Some(value) = <dyn #FQAny>::downcast_ref::<Self>(value) {
+                fn reflect_partial_eq(&self, value: &dyn #bevy_reflect_path::PartialReflect) -> #FQOption<bool> {
+                    let value = <dyn #bevy_reflect_path::PartialReflect>::try_downcast_ref::<Self>(value);
+                    if let #FQOption::Some(value) = value {
                         #FQOption::Some(::core::cmp::PartialEq::eq(self, value))
                     } else {
                         #FQOption::Some(false)
@@ -486,7 +488,7 @@ impl ContainerAttributes {
                 }
             }),
             &TraitImpl::Custom(ref impl_fn, span) => Some(quote_spanned! {span=>
-                fn reflect_partial_eq(&self, value: &dyn #bevy_reflect_path::Reflect) -> #FQOption<bool> {
+                fn reflect_partial_eq(&self, value: &dyn #bevy_reflect_path::PartialReflect) -> #FQOption<bool> {
                     #FQOption::Some(#impl_fn(self, value))
                 }
             }),
@@ -494,7 +496,7 @@ impl ContainerAttributes {
         }
     }
 
-    /// Returns the implementation of `Reflect::debug` as a `TokenStream`.
+    /// Returns the implementation of `PartialReflect::debug` as a `TokenStream`.
     ///
     /// If `Debug` was not registered, returns `None`.
     pub fn get_debug_impl(&self) -> Option<proc_macro2::TokenStream> {

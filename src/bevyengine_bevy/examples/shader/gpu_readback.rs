@@ -129,7 +129,7 @@ impl FromWorld for Buffers {
         // copy the buffer modified by the GPU into a mappable, CPU-accessible buffer
         let cpu_buffer = render_device.create_buffer(&BufferDescriptor {
             label: Some("readback_buffer"),
-            size: (BUFFER_LEN * std::mem::size_of::<u32>()) as u64,
+            size: (BUFFER_LEN * size_of::<u32>()) as u64,
             usage: BufferUsages::MAP_READ | BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
@@ -224,8 +224,8 @@ fn map_and_read_buffer(
     // buffered and receiving will just pick that up.
     //
     // It may also be worth noting that although on native, the usage of asynchronous
-    // channels is wholly unnecessary, for the sake of portability to WASM
-    // we'll use async channels that work on both native and WASM.
+    // channels is wholly unnecessary, for the sake of portability to Wasm
+    // we'll use async channels that work on both native and Wasm.
 
     let (s, r) = crossbeam_channel::unbounded::<()>();
 
@@ -250,7 +250,7 @@ fn map_and_read_buffer(
     {
         let buffer_view = buffer_slice.get_mapped_range();
         let data = buffer_view
-            .chunks(std::mem::size_of::<u32>())
+            .chunks(size_of::<u32>())
             .map(|chunk| u32::from_ne_bytes(chunk.try_into().expect("should be a u32")))
             .collect::<Vec<u32>>();
         sender
@@ -306,7 +306,7 @@ impl render_graph::Node for ComputeNode {
             0,
             &buffers.cpu_buffer,
             0,
-            (BUFFER_LEN * std::mem::size_of::<u32>()) as u64,
+            (BUFFER_LEN * size_of::<u32>()) as u64,
         );
 
         Ok(())

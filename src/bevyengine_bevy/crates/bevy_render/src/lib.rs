@@ -1,7 +1,9 @@
-// FIXME(3492): remove once docs are ready
-#![allow(missing_docs)]
+// FIXME(15321): solve CI failures, then replace with `#![expect()]`.
+#![allow(missing_docs, reason = "Not all docs are written yet, see #3492.")]
 #![allow(unsafe_code)]
-#![cfg_attr(docsrs, feature(doc_auto_cfg))]
+// `rustdoc_internals` is needed for `#[doc(fake_variadics)]`
+#![allow(internal_features)]
+#![cfg_attr(any(docsrs, docsrs_dep), feature(doc_auto_cfg, rustdoc_internals))]
 #![doc(
     html_logo_url = "https://bevyengine.org/assets/icon.png",
     html_favicon_url = "https://bevyengine.org/assets/icon.png"
@@ -33,8 +35,13 @@ pub mod render_resource;
 pub mod renderer;
 pub mod settings;
 mod spatial_bundle;
+pub mod storage;
 pub mod texture;
 pub mod view;
+
+/// The render prelude.
+///
+/// This includes the most common types in this crate, re-exported for your convenience.
 pub mod prelude {
     #[doc(hidden)]
     pub use crate::{
@@ -73,6 +80,7 @@ use crate::{
     render_resource::{PipelineCache, Shader, ShaderLoader},
     renderer::{render_system, RenderInstance},
     settings::RenderCreation,
+    storage::StoragePlugin,
     view::{ViewPlugin, WindowRenderPlugin},
 };
 use bevy_app::{App, AppLabel, Plugin, SubApp};
@@ -102,7 +110,6 @@ pub struct RenderPlugin {
 
 /// The systems sets of the default [`App`] rendering schedule.
 ///
-/// that runs immediately after the matching system set.
 /// These can be useful for ordering, but you almost never want to add your systems to these sets.
 #[derive(Debug, Hash, PartialEq, Eq, Clone, SystemSet)]
 pub enum RenderSet {
@@ -136,6 +143,10 @@ pub enum RenderSet {
     Render,
     /// Cleanup render resources here.
     Cleanup,
+    /// Final cleanup occurs: all entities will be despawned.
+    ///
+    /// Runs after [`Cleanup`](RenderSet::Cleanup).
+    PostCleanup,
 }
 
 /// The main render schedule.
@@ -160,6 +171,7 @@ impl Render {
                 Prepare,
                 Render,
                 Cleanup,
+                PostCleanup,
             )
                 .chain(),
         );
@@ -350,6 +362,7 @@ impl Plugin for RenderPlugin {
             GlobalsPlugin,
             MorphPlugin,
             BatchingPlugin,
+            StoragePlugin,
         ));
 
         app.init_resource::<RenderAssetBytesPerFrame>()
@@ -434,7 +447,8 @@ fn extract(main_world: &mut World, render_world: &mut World) {
     main_world.insert_resource(ScratchMainWorld(scratch_world));
 }
 
-/// SAFETY: this function must be called from the main thread.
+/// # Safety
+/// This function must be called from the main thread.
 unsafe fn initialize_render_app(app: &mut App) {
     app.init_resource::<ScratchMainWorld>();
 
@@ -467,7 +481,7 @@ unsafe fn initialize_render_app(app: &mut App) {
                     render_system,
                 )
                     .in_set(RenderSet::Render),
-                World::clear_entities.in_set(RenderSet::Cleanup),
+                World::clear_entities.in_set(RenderSet::PostCleanup),
             ),
         );
 

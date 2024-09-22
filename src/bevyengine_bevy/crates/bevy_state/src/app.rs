@@ -8,6 +8,9 @@ use crate::state::{
 };
 use crate::state_scoped::clear_state_scoped_entities;
 
+#[cfg(feature = "bevy_reflect")]
+use bevy_reflect::{FromReflect, GetTypeRegistration, Typed};
+
 /// State installation methods for [`App`] and [`SubApp`].
 pub trait AppExtStates {
     /// Initializes a [`State`] with standard starting values.
@@ -55,6 +58,25 @@ pub trait AppExtStates {
     ///
     /// For more information refer to [`StateScoped`](crate::state_scoped::StateScoped).
     fn enable_state_scoped_entities<S: States>(&mut self) -> &mut Self;
+
+    #[cfg(feature = "bevy_reflect")]
+    /// Registers the state type `T` using [`App::register_type`],
+    /// and adds [`ReflectState`](crate::reflect::ReflectState) type data to `T` in the type registry.
+    ///
+    /// This enables reflection code to access the state. For detailed information, see the docs on [`crate::reflect::ReflectState`] .
+    fn register_type_state<S>(&mut self) -> &mut Self
+    where
+        S: States + FromReflect + GetTypeRegistration + Typed;
+
+    #[cfg(feature = "bevy_reflect")]
+    /// Registers the state type `T` using [`App::register_type`],
+    /// and adds [`crate::reflect::ReflectState`] and [`crate::reflect::ReflectFreelyMutableState`] type data to `T` in the type registry.
+    ///
+    /// This enables reflection code to access and modify the state.
+    /// For detailed information, see the docs on [`crate::reflect::ReflectState`] and [`crate::reflect::ReflectFreelyMutableState`].
+    fn register_type_mutable_state<S>(&mut self) -> &mut Self
+    where
+        S: FreelyMutableState + FromReflect + GetTypeRegistration + Typed;
 }
 
 /// Separate function to only warn once for all state installation methods.
@@ -95,7 +117,7 @@ impl AppExtStates for SubApp {
                 .init_resource::<NextState<S>>()
                 .add_event::<StateTransitionEvent<S>>();
             let schedule = self.get_schedule_mut(StateTransition).expect(
-                "The `StateTransition` schedule is missing. Did you forget to add StatesPlugin or DefaultPlugins before calling init_state?"
+                "The `StateTransition` schedule is missing. Did you forget to add StatesPlugin or DefaultPlugins before calling insert_state?"
             );
             S::register_state(schedule);
             self.world_mut().send_event(StateTransitionEvent {
@@ -124,7 +146,9 @@ impl AppExtStates for SubApp {
             .contains_resource::<Events<StateTransitionEvent<S>>>()
         {
             self.add_event::<StateTransitionEvent<S>>();
-            let schedule = self.get_schedule_mut(StateTransition).unwrap();
+            let schedule = self.get_schedule_mut(StateTransition).expect(
+                "The `StateTransition` schedule is missing. Did you forget to add StatesPlugin or DefaultPlugins before calling add_computed_state?"
+            );
             S::register_computed_state_systems(schedule);
             let state = self
                 .world()
@@ -150,7 +174,9 @@ impl AppExtStates for SubApp {
         {
             self.init_resource::<NextState<S>>();
             self.add_event::<StateTransitionEvent<S>>();
-            let schedule = self.get_schedule_mut(StateTransition).unwrap();
+            let schedule = self.get_schedule_mut(StateTransition).expect(
+                "The `StateTransition` schedule is missing. Did you forget to add StatesPlugin or DefaultPlugins before calling add_sub_state?"
+            );
             S::register_sub_state_systems(schedule);
             let state = self
                 .world()
@@ -183,6 +209,30 @@ impl AppExtStates for SubApp {
             clear_state_scoped_entities::<S>.in_set(StateTransitionSteps::ExitSchedules),
         )
     }
+
+    #[cfg(feature = "bevy_reflect")]
+    fn register_type_state<S>(&mut self) -> &mut Self
+    where
+        S: States + FromReflect + GetTypeRegistration + Typed,
+    {
+        self.register_type::<S>();
+        self.register_type::<State<S>>();
+        self.register_type_data::<S, crate::reflect::ReflectState>();
+        self
+    }
+
+    #[cfg(feature = "bevy_reflect")]
+    fn register_type_mutable_state<S>(&mut self) -> &mut Self
+    where
+        S: FreelyMutableState + FromReflect + GetTypeRegistration + Typed,
+    {
+        self.register_type::<S>();
+        self.register_type::<State<S>>();
+        self.register_type::<NextState<S>>();
+        self.register_type_data::<S, crate::reflect::ReflectState>();
+        self.register_type_data::<S, crate::reflect::ReflectFreelyMutableState>();
+        self
+    }
 }
 
 impl AppExtStates for App {
@@ -208,6 +258,24 @@ impl AppExtStates for App {
 
     fn enable_state_scoped_entities<S: States>(&mut self) -> &mut Self {
         self.main_mut().enable_state_scoped_entities::<S>();
+        self
+    }
+
+    #[cfg(feature = "bevy_reflect")]
+    fn register_type_state<S>(&mut self) -> &mut Self
+    where
+        S: States + FromReflect + GetTypeRegistration + Typed,
+    {
+        self.main_mut().register_type_state::<S>();
+        self
+    }
+
+    #[cfg(feature = "bevy_reflect")]
+    fn register_type_mutable_state<S>(&mut self) -> &mut Self
+    where
+        S: FreelyMutableState + FromReflect + GetTypeRegistration + Typed,
+    {
+        self.main_mut().register_type_mutable_state::<S>();
         self
     }
 }

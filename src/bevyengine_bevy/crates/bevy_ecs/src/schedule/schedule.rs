@@ -23,6 +23,8 @@ use crate::{
     world::World,
 };
 
+use crate::query::AccessConflicts;
+use crate::storage::SparseSetIndex;
 pub use stepping::Stepping;
 
 /// Resource that stores [`Schedule`]s mapped to [`ScheduleLabel`]s excluding the current running [`Schedule`].
@@ -244,7 +246,7 @@ pub enum Chain {
 /// fn system_one() { println!("System 1 works!") }
 /// fn system_two() { println!("System 2 works!") }
 /// fn system_three() { println!("System 3 works!") }
-///    
+///
 /// fn main() {
 ///     let mut world = World::new();
 ///     let mut schedule = Schedule::default();
@@ -1363,14 +1365,22 @@ impl ScheduleGraph {
                 let access_a = system_a.component_access();
                 let access_b = system_b.component_access();
                 if !access_a.is_compatible(access_b) {
-                    let conflicts: Vec<_> = access_a
-                        .get_conflicts(access_b)
-                        .into_iter()
-                        .filter(|id| !ignored_ambiguities.contains(id))
-                        .collect();
-
-                    if !conflicts.is_empty() {
-                        conflicting_systems.push((a, b, conflicts));
+                    match access_a.get_conflicts(access_b) {
+                        AccessConflicts::Individual(conflicts) => {
+                            let conflicts: Vec<_> = conflicts
+                                .ones()
+                                .map(ComponentId::get_sparse_set_index)
+                                .filter(|id| !ignored_ambiguities.contains(id))
+                                .collect();
+                            if !conflicts.is_empty() {
+                                conflicting_systems.push((a, b, conflicts));
+                            }
+                        }
+                        AccessConflicts::All => {
+                            // there is no specific component conflicting, but the systems are overall incompatible
+                            // for example 2 systems with `Query<EntityMut>`
+                            conflicting_systems.push((a, b, Vec::new()));
+                        }
                     }
                 }
             }
@@ -1572,7 +1582,7 @@ impl ScheduleGraph {
 
     #[inline]
     fn get_node_name_inner(&self, id: &NodeId, report_sets: bool) -> String {
-        let mut name = match id {
+        let name = match id {
             NodeId::System(_) => {
                 let name = self.systems[id.index()].get().unwrap().name().to_string();
                 if report_sets {
@@ -1597,9 +1607,15 @@ impl ScheduleGraph {
                 }
             }
         };
-        if self.settings.use_shortnames {
-            name = bevy_utils::get_short_name(&name);
+        #[cfg(feature = "bevy_reflect")]
+        {
+            if self.settings.use_shortnames {
+                bevy_reflect::ShortName(&name).to_string()
+            } else {
+                name
+            }
         }
+        #[cfg(not(feature = "bevy_reflect"))]
         name
     }
 
@@ -1883,7 +1899,7 @@ impl ScheduleGraph {
         &'a self,
         ambiguities: &'a [(NodeId, NodeId, Vec<ComponentId>)],
         components: &'a Components,
-    ) -> impl Iterator<Item = (String, String, Vec<&str>)> + 'a {
+    ) -> impl Iterator<Item = (String, String, Vec<&'a str>)> + 'a {
         ambiguities
             .iter()
             .map(move |(system_a, system_b, conflicts)| {
@@ -2002,6 +2018,7 @@ pub struct ScheduleBuildSettings {
     /// If set to true, node names will be shortened instead of the fully qualified type path.
     ///
     /// Defaults to `true`.
+    #[cfg(feature = "bevy_reflect")]
     pub use_shortnames: bool,
     /// If set to true, report all system sets the conflicting systems are part of.
     ///
@@ -2023,6 +2040,7 @@ impl ScheduleBuildSettings {
             ambiguity_detection: LogLevel::Ignore,
             hierarchy_detection: LogLevel::Warn,
             auto_insert_apply_deferred: true,
+            #[cfg(feature = "bevy_reflect")]
             use_shortnames: true,
             report_sets: true,
         }

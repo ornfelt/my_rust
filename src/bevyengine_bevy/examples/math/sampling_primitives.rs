@@ -3,7 +3,7 @@
 use std::f32::consts::PI;
 
 use bevy::{
-    core_pipeline::{bloom::BloomSettings, tonemapping::Tonemapping},
+    core_pipeline::{bloom::Bloom, tonemapping::Tonemapping},
     input::mouse::{AccumulatedMouseMotion, AccumulatedMouseScroll, MouseButtonInput},
     math::prelude::*,
     prelude::*,
@@ -174,7 +174,7 @@ impl Shape {
 
 impl ShapeSample for Shape {
     type Output = Vec3;
-    fn sample_interior<R: rand::Rng + ?Sized>(&self, rng: &mut R) -> Vec3 {
+    fn sample_interior<R: Rng + ?Sized>(&self, rng: &mut R) -> Vec3 {
         match self {
             Shape::Cuboid => CUBOID.sample_interior(rng),
             Shape::Sphere => SPHERE.sample_interior(rng),
@@ -185,7 +185,7 @@ impl ShapeSample for Shape {
         }
     }
 
-    fn sample_boundary<R: rand::prelude::Rng + ?Sized>(&self, rng: &mut R) -> Self::Output {
+    fn sample_boundary<R: Rng + ?Sized>(&self, rng: &mut R) -> Self::Output {
         match self {
             Shape::Cuboid => CUBOID.sample_boundary(rng),
             Shape::Sphere => SPHERE.sample_boundary(rng),
@@ -355,7 +355,7 @@ fn setup(
             transform: Transform::from_xyz(-2.0, 3.0, 5.0).looking_at(Vec3::ZERO, Vec3::Y),
             ..default()
         },
-        BloomSettings::NATURAL,
+        Bloom::NATURAL,
         CameraRig {
             yaw: 0.56,
             pitch: 0.45,

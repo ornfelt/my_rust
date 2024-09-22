@@ -9,7 +9,7 @@ use crate::error::HttpSnafu;
 use crate::models::pulls::ReviewComment;
 use crate::models::CommentId;
 use crate::pulls::specific_pr::pr_reviews::specific_review::SpecificReviewBuilder;
-use crate::pulls::specific_pr::SpecificPullRequestBuilder;
+use crate::pulls::specific_pr::{SpecificPullRequestBuilder, SpecificPullRequestCommitBuilder};
 use crate::{Octocrab, Page};
 
 pub use self::{
@@ -406,7 +406,7 @@ impl<'octo> PullRequestHandler<'octo> {
     ///
     #[deprecated(
         since = "0.34.4",
-        note = "specific PR builder transitioned to pr_review_actions, reply_to_comment, reply_to_comment"
+        note = "specific PR builder transitioned to pr_review_actions, pr_commits, reply_to_comment"
     )]
     //FIXME: remove?
     pub fn pull_number(&self, pull_nr: u64) -> SpecificPullRequestBuilder {
@@ -425,10 +425,27 @@ impl<'octo> PullRequestHandler<'octo> {
         SpecificReviewBuilder::new(self, pull_nr, review_id)
     }
 
-    /// /repos/{owner}/{repo}/pulls/{pull_number}/commits
-    // pub fn pr_commits(&self, pull_nr: u64) -> SpecificPullRequestCommentBuilder<'octo, '_> {
-    //     SpecificPullRequestCommentBuilder::new(self, pull_nr, 0)
-    // }
+    /// Lists a maximum of 250 commits for a pull request.
+    ///
+    /// To receive a complete commit list for pull requests with more than 250 commits,
+    /// use the [List commits](https://docs.github.com/rest/commits/commits#list-commits) endpoint.
+    ///
+    /// ```no_run
+    /// # async fn run() -> octocrab::Result<()> {
+    /// let commits = octocrab::instance()
+    ///     .pulls("owner", "repo")
+    ///     .pr_commits(21u64)
+    ///     .per_page(100)
+    ///     .page(2u32)
+    ///     .send()
+    ///     .await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    // /repos/{owner}/{repo}/pulls/{pull_number}/commits
+    pub fn pr_commits(&self, pr_number: u64) -> SpecificPullRequestCommitBuilder<'_, '_> {
+        SpecificPullRequestCommitBuilder::new(self, pr_number)
+    }
 
     // /repos/{owner}/{repo}/pulls/{pull_number}/comments/{comment_id}/replies
     /// Creates a reply to a specific comment of a pull request specified in the first argument

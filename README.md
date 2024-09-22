@@ -14,3 +14,6 @@ ndelvalle_rustapi [src/ndelvalle_rustapi](src/ndelvalle_rustapi)
 XAMPPRocky_octocrab [src/XAMPPRocky_octocrab](src/XAMPPRocky_octocrab)
 
 
+bones-ai_rust-snake-ai [ai/bones-ai_rust-snake-ai](ai/bones-ai_rust-snake-ai)
+
+

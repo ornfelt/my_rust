@@ -53,11 +53,15 @@ impl Debug for TypeRegistryArc {
 /// This trait is automatically implemented for items using [`#[derive(Reflect)]`](derive@crate::Reflect).
 /// The macro also allows [`TypeData`] to be more easily registered.
 ///
+/// If you need to use this trait as a generic bound along with other reflection traits,
+/// for your convenience, consider using [`Reflectable`] instead.
+///
 /// See the [crate-level documentation] for more information on type registration.
 ///
+/// [`Reflectable`]: crate::Reflectable
 /// [crate-level documentation]: crate
 #[diagnostic::on_unimplemented(
-    message = "`{Self}` does not provide type registration information",
+    message = "`{Self}` does not implement `GetTypeRegistration` so cannot provide type registration information",
     note = "consider annotating `{Self}` with `#[derive(Reflect)]`"
 )]
 pub trait GetTypeRegistration: 'static {
@@ -574,7 +578,7 @@ pub trait FromType<T> {
 /// [`FromType::from_type`].
 #[derive(Clone)]
 pub struct ReflectSerialize {
-    get_serializable: for<'a> fn(value: &'a dyn Reflect) -> Serializable,
+    get_serializable: fn(value: &dyn Reflect) -> Serializable,
 }
 
 impl<T: TypePath + FromReflect + erased_serde::Serialize> FromType<T> for ReflectSerialize {
@@ -584,7 +588,7 @@ impl<T: TypePath + FromReflect + erased_serde::Serialize> FromType<T> for Reflec
                 value
                     .downcast_ref::<T>()
                     .map(|value| Serializable::Borrowed(value))
-                    .or_else(|| T::from_reflect(value).map(|value| Serializable::Owned(Box::new(value))))
+                    .or_else(|| T::from_reflect(value.as_partial_reflect()).map(|value| Serializable::Owned(Box::new(value))))
                     .unwrap_or_else(|| {
                         panic!(
                             "FromReflect::from_reflect failed when called on type `{}` with this value: {value:?}",
@@ -788,7 +792,11 @@ mod test {
             let dyn_reflect = unsafe { reflect_from_ptr.as_reflect(Ptr::from(&value)) };
             match dyn_reflect.reflect_ref() {
                 bevy_reflect::ReflectRef::Struct(strukt) => {
-                    let a = strukt.field("a").unwrap().downcast_ref::<f32>().unwrap();
+                    let a = strukt
+                        .field("a")
+                        .unwrap()
+                        .try_downcast_ref::<f32>()
+                        .unwrap();
                     assert_eq!(*a, 2.0);
                 }
                 _ => panic!("invalid reflection"),
