@@ -1,0 +1,9 @@
+# learn
+https://github.com/ndelvalle/rustapi
+https://github.com/LukeMathWalker/zero-to-production
+https://github.com/XAMPPRocky/octocrab
+https://github.com/bevyengine/bevy
+
+# ai
+https://github.com/bones-ai/rust-snake-ai
+
