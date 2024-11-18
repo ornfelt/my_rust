@@ -4,6 +4,9 @@ use std::ffi::CString;
 use std::os::raw::c_char;
 use std::slice;
 
+// OBS: copy Navigation.dll to source dir to be able to run from there... Or Run from same dir as
+// build.rs...
+
 #[repr(C)]
 struct XYZ {
     x: c_float,
