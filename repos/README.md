@@ -10,4 +10,8 @@ ndelvalle_rustapi [learn/ndelvalle_rustapi](learn/ndelvalle_rustapi)
 
 bones-ai_rust-snake-ai [ai/bones-ai_rust-snake-ai](ai/bones-ai_rust-snake-ai)
 
+sphaerophoria_stream-os [spha/sphaerophoria_stream-os](spha/sphaerophoria_stream-os)
+
+sphaerophoria_termie [spha/sphaerophoria_termie](spha/sphaerophoria_termie)
+
 
