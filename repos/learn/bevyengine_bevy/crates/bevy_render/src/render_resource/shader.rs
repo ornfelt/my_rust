@@ -3,7 +3,6 @@ use crate::define_atomic_id;
 use alloc::borrow::Cow;
 use bevy_asset::{io::Reader, Asset, AssetLoader, AssetPath, Handle, LoadContext};
 use bevy_reflect::TypePath;
-use bevy_utils::tracing::error;
 use core::marker::Copy;
 use thiserror::Error;
 
@@ -259,11 +258,11 @@ impl AssetLoader for ShaderLoader {
     type Asset = Shader;
     type Settings = ();
     type Error = ShaderLoaderError;
-    async fn load<'a>(
-        &'a self,
-        reader: &'a mut dyn Reader,
-        _settings: &'a Self::Settings,
-        load_context: &'a mut LoadContext<'_>,
+    async fn load(
+        &self,
+        reader: &mut dyn Reader,
+        _settings: &Self::Settings,
+        load_context: &mut LoadContext<'_>,
     ) -> Result<Shader, Self::Error> {
         let ext = load_context.path().extension().unwrap().to_str().unwrap();
         let path = load_context.asset_path().to_string();

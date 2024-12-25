@@ -23,24 +23,22 @@ pub use source::*;
 
 use alloc::sync::Arc;
 use bevy_utils::{BoxedFuture, ConditionalSendFuture};
+use core::future::Future;
 use core::{
     mem::size_of,
     pin::Pin,
     task::{Context, Poll},
 };
-use futures_io::{AsyncRead, AsyncSeek, AsyncWrite};
+use futures_io::{AsyncRead, AsyncWrite};
 use futures_lite::{ready, Stream};
-use std::{
-    io::SeekFrom,
-    path::{Path, PathBuf},
-};
+use std::path::{Path, PathBuf};
 use thiserror::Error;
 
 /// Errors that occur while loading assets.
 #[derive(Error, Debug, Clone)]
 pub enum AssetReaderError {
     /// Path not found.
-    #[error("Path not found: {0}")]
+    #[error("Path not found: {}", _0.display())]
     NotFound(PathBuf),
 
     /// Encountered an I/O error while loading an asset.
@@ -83,13 +81,85 @@ pub const STACK_FUTURE_SIZE: usize = 10 * size_of::<&()>();
 
 pub use stackfuture::StackFuture;
 
+/// Asynchronously advances the cursor position by a specified number of bytes.
+///
+/// This trait is a simplified version of the [`futures_io::AsyncSeek`] trait, providing
+/// support exclusively for the [`futures_io::SeekFrom::Current`] variant. It allows for relative
+/// seeking from the current cursor position.
+pub trait AsyncSeekForward {
+    /// Attempts to asynchronously seek forward by a specified number of bytes from the current cursor position.
+    ///
+    /// Seeking beyond the end of the stream is allowed and the behavior for this case is defined by the implementation.
+    /// The new position, relative to the beginning of the stream, should be returned upon successful completion
+    /// of the seek operation.
+    ///
+    /// If the seek operation completes successfully,
+    /// the new position relative to the beginning of the stream should be returned.
+    ///
+    /// # Implementation
+    ///
+    /// Implementations of this trait should handle [`Poll::Pending`] correctly, converting
+    /// [`std::io::ErrorKind::WouldBlock`] errors into [`Poll::Pending`] to indicate that the operation is not
+    /// yet complete and should be retried, and either internally retry or convert
+    /// [`std::io::ErrorKind::Interrupted`] into another error kind.
+    fn poll_seek_forward(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        offset: u64,
+    ) -> Poll<futures_io::Result<u64>>;
+}
+
+impl<T: ?Sized + AsyncSeekForward + Unpin> AsyncSeekForward for Box<T> {
+    fn poll_seek_forward(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        offset: u64,
+    ) -> Poll<futures_io::Result<u64>> {
+        Pin::new(&mut **self).poll_seek_forward(cx, offset)
+    }
+}
+
+/// Extension trait for [`AsyncSeekForward`].
+pub trait AsyncSeekForwardExt: AsyncSeekForward {
+    /// Seek by the provided `offset` in the forwards direction, using the [`AsyncSeekForward`] trait.
+    fn seek_forward(&mut self, offset: u64) -> SeekForwardFuture<'_, Self>
+    where
+        Self: Unpin,
+    {
+        SeekForwardFuture {
+            seeker: self,
+            offset,
+        }
+    }
+}
+
+impl<R: AsyncSeekForward + ?Sized> AsyncSeekForwardExt for R {}
+
+#[derive(Debug)]
+#[must_use = "futures do nothing unless you `.await` or poll them"]
+pub struct SeekForwardFuture<'a, S: Unpin + ?Sized> {
+    seeker: &'a mut S,
+    offset: u64,
+}
+
+impl<S: Unpin + ?Sized> Unpin for SeekForwardFuture<'_, S> {}
+
+impl<S: AsyncSeekForward + Unpin + ?Sized> Future for SeekForwardFuture<'_, S> {
+    type Output = futures_lite::io::Result<u64>;
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let offset = self.offset;
+        Pin::new(&mut *self.seeker).poll_seek_forward(cx, offset)
+    }
+}
+
 /// A type returned from [`AssetReader::read`], which is used to read the contents of a file
 /// (or virtual file) corresponding to an asset.
 ///
-/// This is essentially a trait alias for types implementing  [`AsyncRead`] and [`AsyncSeek`].
+/// This is essentially a trait alias for types implementing [`AsyncRead`] and [`AsyncSeekForward`].
 /// The only reason a blanket implementation is not provided for applicable types is to allow
 /// implementors to override the provided implementation of [`Reader::read_to_end`].
-pub trait Reader: AsyncRead + AsyncSeek + Unpin + Send + Sync {
+pub trait Reader: AsyncRead + AsyncSeekForward + Unpin + Send + Sync {
     /// Reads the entire contents of this reader and appends them to a vec.
     ///
     /// # Note for implementors
@@ -312,6 +382,12 @@ pub trait AssetWriter: Send + Sync + 'static {
         old_path: &'a Path,
         new_path: &'a Path,
     ) -> impl ConditionalSendFuture<Output = Result<(), AssetWriterError>>;
+    /// Creates a directory at the given path, including all parent directories if they do not
+    /// already exist.
+    fn create_directory<'a>(
+        &'a self,
+        path: &'a Path,
+    ) -> impl ConditionalSendFuture<Output = Result<(), AssetWriterError>>;
     /// Removes the directory at the given path, including all assets _and_ directories in that directory.
     fn remove_directory<'a>(
         &'a self,
@@ -388,6 +464,12 @@ pub trait ErasedAssetWriter: Send + Sync + 'static {
         old_path: &'a Path,
         new_path: &'a Path,
     ) -> BoxedFuture<'a, Result<(), AssetWriterError>>;
+    /// Creates a directory at the given path, including all parent directories if they do not
+    /// already exist.
+    fn create_directory<'a>(
+        &'a self,
+        path: &'a Path,
+    ) -> BoxedFuture<'a, Result<(), AssetWriterError>>;
     /// Removes the directory at the given path, including all assets _and_ directories in that directory.
     fn remove_directory<'a>(
         &'a self,
@@ -450,6 +532,12 @@ impl<T: AssetWriter> ErasedAssetWriter for T {
         new_path: &'a Path,
     ) -> BoxedFuture<'a, Result<(), AssetWriterError>> {
         Box::pin(Self::rename_meta(self, old_path, new_path))
+    }
+    fn create_directory<'a>(
+        &'a self,
+        path: &'a Path,
+    ) -> BoxedFuture<'a, Result<(), AssetWriterError>> {
+        Box::pin(Self::create_directory(self, path))
     }
     fn remove_directory<'a>(
         &'a self,
@@ -559,32 +647,20 @@ impl AsyncRead for VecReader {
     }
 }
 
-impl AsyncSeek for VecReader {
-    fn poll_seek(
+impl AsyncSeekForward for VecReader {
+    fn poll_seek_forward(
         mut self: Pin<&mut Self>,
         _cx: &mut Context<'_>,
-        pos: SeekFrom,
+        offset: u64,
     ) -> Poll<std::io::Result<u64>> {
-        let result = match pos {
-            SeekFrom::Start(offset) => offset.try_into(),
-            SeekFrom::End(offset) => self.bytes.len().try_into().map(|len: i64| len - offset),
-            SeekFrom::Current(offset) => self
-                .bytes_read
-                .try_into()
-                .map(|bytes_read: i64| bytes_read + offset),
-        };
+        let result = self
+            .bytes_read
+            .try_into()
+            .map(|bytes_read: u64| bytes_read + offset);
 
         if let Ok(new_pos) = result {
-            if new_pos < 0 {
-                Poll::Ready(Err(std::io::Error::new(
-                    std::io::ErrorKind::InvalidInput,
-                    "seek position is out of range",
-                )))
-            } else {
-                self.bytes_read = new_pos as _;
-
-                Poll::Ready(Ok(new_pos as _))
-            }
+            self.bytes_read = new_pos as _;
+            Poll::Ready(Ok(new_pos as _))
         } else {
             Poll::Ready(Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
@@ -644,32 +720,21 @@ impl<'a> AsyncRead for SliceReader<'a> {
     }
 }
 
-impl<'a> AsyncSeek for SliceReader<'a> {
-    fn poll_seek(
+impl<'a> AsyncSeekForward for SliceReader<'a> {
+    fn poll_seek_forward(
         mut self: Pin<&mut Self>,
         _cx: &mut Context<'_>,
-        pos: SeekFrom,
+        offset: u64,
     ) -> Poll<std::io::Result<u64>> {
-        let result = match pos {
-            SeekFrom::Start(offset) => offset.try_into(),
-            SeekFrom::End(offset) => self.bytes.len().try_into().map(|len: i64| len - offset),
-            SeekFrom::Current(offset) => self
-                .bytes_read
-                .try_into()
-                .map(|bytes_read: i64| bytes_read + offset),
-        };
+        let result = self
+            .bytes_read
+            .try_into()
+            .map(|bytes_read: u64| bytes_read + offset);
 
         if let Ok(new_pos) = result {
-            if new_pos < 0 {
-                Poll::Ready(Err(std::io::Error::new(
-                    std::io::ErrorKind::InvalidInput,
-                    "seek position is out of range",
-                )))
-            } else {
-                self.bytes_read = new_pos as _;
+            self.bytes_read = new_pos as _;
 
-                Poll::Ready(Ok(new_pos as _))
-            }
+            Poll::Ready(Ok(new_pos as _))
         } else {
             Poll::Ready(Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
@@ -714,10 +779,7 @@ struct EmptyPathStream;
 impl Stream for EmptyPathStream {
     type Item = PathBuf;
 
-    fn poll_next(
-        self: Pin<&mut Self>,
-        _cx: &mut core::task::Context<'_>,
-    ) -> Poll<Option<Self::Item>> {
+    fn poll_next(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         Poll::Ready(None)
     }
 }

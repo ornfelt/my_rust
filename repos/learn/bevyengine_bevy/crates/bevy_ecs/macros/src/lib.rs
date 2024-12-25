@@ -1,5 +1,4 @@
-// FIXME(15321): solve CI failures, then replace with `#![expect()]`.
-#![allow(missing_docs, reason = "Not all docs are written yet, see #3492.")]
+#![expect(missing_docs, reason = "Not all docs are written yet, see #3492.")]
 #![cfg_attr(docsrs, feature(doc_auto_cfg))]
 
 extern crate proc_macro;
@@ -13,11 +12,11 @@ mod world_query;
 use crate::{query_data::derive_query_data_impl, query_filter::derive_query_filter_impl};
 use bevy_macro_utils::{derive_label, ensure_no_collision, get_struct_fields, BevyManifest};
 use proc_macro::TokenStream;
-use proc_macro2::Span;
+use proc_macro2::TokenStream as TokenStream2;
 use quote::{format_ident, quote};
 use syn::{
     parse_macro_input, parse_quote, punctuated::Punctuated, spanned::Spanned, token::Comma,
-    ConstParam, DeriveInput, GenericParam, Ident, Index, TypeParam,
+    ConstParam, DeriveInput, GenericParam, Index, TypeParam,
 };
 
 enum BundleFieldKind {
@@ -180,130 +179,108 @@ pub fn derive_bundle(input: TokenStream) -> TokenStream {
     })
 }
 
-fn get_idents(fmt_string: fn(usize) -> String, count: usize) -> Vec<Ident> {
-    (0..count)
-        .map(|i| Ident::new(&fmt_string(i), Span::call_site()))
-        .collect::<Vec<Ident>>()
+fn derive_visit_entities_base(
+    input: TokenStream,
+    trait_name: TokenStream2,
+    gen_methods: impl FnOnce(Vec<TokenStream2>) -> TokenStream2,
+) -> TokenStream {
+    let ast = parse_macro_input!(input as DeriveInput);
+    let ecs_path = bevy_ecs_path();
+
+    let named_fields = match get_struct_fields(&ast.data) {
+        Ok(fields) => fields,
+        Err(e) => return e.into_compile_error().into(),
+    };
+
+    let field = named_fields
+        .iter()
+        .filter_map(|field| {
+            if let Some(attr) = field
+                .attrs
+                .iter()
+                .find(|a| a.path().is_ident("visit_entities"))
+            {
+                let ignore = attr.parse_nested_meta(|meta| {
+                    if meta.path.is_ident("ignore") {
+                        Ok(())
+                    } else {
+                        Err(meta.error("Invalid visit_entities attribute. Use `ignore`"))
+                    }
+                });
+                return match ignore {
+                    Ok(()) => None,
+                    Err(e) => Some(Err(e)),
+                };
+            }
+            Some(Ok(field))
+        })
+        .map(|res| res.map(|field| field.ident.as_ref()))
+        .collect::<Result<Vec<_>, _>>();
+
+    let field = match field {
+        Ok(field) => field,
+        Err(e) => return e.into_compile_error().into(),
+    };
+
+    if field.is_empty() {
+        return syn::Error::new(
+            ast.span(),
+            format!("Invalid `{}` type: at least one field", trait_name),
+        )
+        .into_compile_error()
+        .into();
+    }
+
+    let field_access = field
+        .iter()
+        .enumerate()
+        .map(|(n, f)| {
+            if let Some(ident) = f {
+                quote! {
+                    self.#ident
+                }
+            } else {
+                let idx = Index::from(n);
+                quote! {
+                    self.#idx
+                }
+            }
+        })
+        .collect::<Vec<_>>();
+
+    let methods = gen_methods(field_access);
+
+    let generics = ast.generics;
+    let (impl_generics, ty_generics, _) = generics.split_for_impl();
+    let struct_name = &ast.ident;
+
+    TokenStream::from(quote! {
+        impl #impl_generics #ecs_path::entity:: #trait_name for #struct_name #ty_generics {
+            #methods
+        }
+    })
 }
 
-#[proc_macro]
-pub fn impl_param_set(_input: TokenStream) -> TokenStream {
-    let mut tokens = TokenStream::new();
-    let max_params = 8;
-    let params = get_idents(|i| format!("P{i}"), max_params);
-    let metas = get_idents(|i| format!("m{i}"), max_params);
-    let mut param_fn_muts = Vec::new();
-    for (i, param) in params.iter().enumerate() {
-        let fn_name = Ident::new(&format!("p{i}"), Span::call_site());
-        let index = Index::from(i);
-        let ordinal = match i {
-            1 => "1st".to_owned(),
-            2 => "2nd".to_owned(),
-            3 => "3rd".to_owned(),
-            x => format!("{x}th"),
-        };
-        let comment =
-            format!("Gets exclusive access to the {ordinal} parameter in this [`ParamSet`].");
-        param_fn_muts.push(quote! {
-            #[doc = #comment]
-            /// No other parameters may be accessed while this one is active.
-            pub fn #fn_name<'a>(&'a mut self) -> SystemParamItem<'a, 'a, #param> {
-                // SAFETY: systems run without conflicts with other systems.
-                // Conflicting params in ParamSet are not accessible at the same time
-                // ParamSets are guaranteed to not conflict with other SystemParams
-                unsafe {
-                    #param::get_param(&mut self.param_states.#index, &self.system_meta, self.world, self.change_tick)
-                }
+#[proc_macro_derive(VisitEntitiesMut, attributes(visit_entities))]
+pub fn derive_visit_entities_mut(input: TokenStream) -> TokenStream {
+    derive_visit_entities_base(input, quote! { VisitEntitiesMut }, |field| {
+        quote! {
+            fn visit_entities_mut<F: FnMut(&mut Entity)>(&mut self, mut f: F) {
+                #(#field.visit_entities_mut(&mut f);)*
             }
-        });
-    }
+        }
+    })
+}
 
-    for param_count in 1..=max_params {
-        let param = &params[0..param_count];
-        let meta = &metas[0..param_count];
-        let param_fn_mut = &param_fn_muts[0..param_count];
-        tokens.extend(TokenStream::from(quote! {
-            // SAFETY: All parameters are constrained to ReadOnlySystemParam, so World is only read
-            unsafe impl<'w, 's, #(#param,)*> ReadOnlySystemParam for ParamSet<'w, 's, (#(#param,)*)>
-            where #(#param: ReadOnlySystemParam,)*
-            { }
-
-            // SAFETY: Relevant parameter ComponentId and ArchetypeComponentId access is applied to SystemMeta. If any ParamState conflicts
-            // with any prior access, a panic will occur.
-            unsafe impl<'_w, '_s, #(#param: SystemParam,)*> SystemParam for ParamSet<'_w, '_s, (#(#param,)*)>
-            {
-                type State = (#(#param::State,)*);
-                type Item<'w, 's> = ParamSet<'w, 's, (#(#param,)*)>;
-
-                // Note: We allow non snake case so the compiler don't complain about the creation of non_snake_case variables
-                #[allow(non_snake_case)]
-                fn init_state(world: &mut World, system_meta: &mut SystemMeta) -> Self::State {
-                    #(
-                        // Pretend to add each param to the system alone, see if it conflicts
-                        let mut #meta = system_meta.clone();
-                        #meta.component_access_set.clear();
-                        #meta.archetype_component_access.clear();
-                        #param::init_state(world, &mut #meta);
-                        // The variable is being defined with non_snake_case here
-                        let #param = #param::init_state(world, &mut system_meta.clone());
-                    )*
-                    // Make the ParamSet non-send if any of its parameters are non-send.
-                    if false #(|| !#meta.is_send())* {
-                        system_meta.set_non_send();
-                    }
-                    #(
-                        system_meta
-                            .component_access_set
-                            .extend(#meta.component_access_set);
-                        system_meta
-                            .archetype_component_access
-                            .extend(&#meta.archetype_component_access);
-                    )*
-                    (#(#param,)*)
-                }
-
-                unsafe fn new_archetype(state: &mut Self::State, archetype: &Archetype, system_meta: &mut SystemMeta) {
-                    // SAFETY: The caller ensures that `archetype` is from the World the state was initialized from in `init_state`.
-                    unsafe { <(#(#param,)*) as SystemParam>::new_archetype(state, archetype, system_meta); }
-                }
-
-                fn apply(state: &mut Self::State, system_meta: &SystemMeta, world: &mut World) {
-                    <(#(#param,)*) as SystemParam>::apply(state, system_meta, world);
-                }
-
-                #[inline]
-                unsafe fn validate_param<'w, 's>(
-                    state: &'s Self::State,
-                    system_meta: &SystemMeta,
-                    world: UnsafeWorldCell<'w>,
-                ) -> bool {
-                    <(#(#param,)*) as SystemParam>::validate_param(state, system_meta, world)
-                }
-
-                #[inline]
-                unsafe fn get_param<'w, 's>(
-                    state: &'s mut Self::State,
-                    system_meta: &SystemMeta,
-                    world: UnsafeWorldCell<'w>,
-                    change_tick: Tick,
-                ) -> Self::Item<'w, 's> {
-                    ParamSet {
-                        param_states: state,
-                        system_meta: system_meta.clone(),
-                        world,
-                        change_tick,
-                    }
-                }
+#[proc_macro_derive(VisitEntities, attributes(visit_entities))]
+pub fn derive_visit_entities(input: TokenStream) -> TokenStream {
+    derive_visit_entities_base(input, quote! { VisitEntities }, |field| {
+        quote! {
+            fn visit_entities<F: FnMut(Entity)>(&self, mut f: F) {
+                #(#field.visit_entities(&mut f);)*
             }
-
-            impl<'w, 's, #(#param: SystemParam,)*> ParamSet<'w, 's, (#(#param,)*)>
-            {
-                #(#param_fn_mut)*
-            }
-        }));
-    }
-
-    tokens
+        }
+    })
 }
 
 /// Implement `SystemParam` to use a struct as a parameter in a system
@@ -599,7 +576,7 @@ pub fn derive_system_set(input: TokenStream) -> TokenStream {
 }
 
 pub(crate) fn bevy_ecs_path() -> syn::Path {
-    BevyManifest::default().get_path("bevy_ecs")
+    BevyManifest::shared().get_path("bevy_ecs")
 }
 
 #[proc_macro_derive(Event)]
@@ -612,9 +589,17 @@ pub fn derive_resource(input: TokenStream) -> TokenStream {
     component::derive_resource(input)
 }
 
-#[proc_macro_derive(Component, attributes(component, require))]
+#[proc_macro_derive(Component, attributes(component))]
 pub fn derive_component(input: TokenStream) -> TokenStream {
     component::derive_component(input)
+}
+
+/// Allows specifying a component's required components.
+///
+/// See `Component` docs for usage.
+#[proc_macro_attribute]
+pub fn require(attr: TokenStream, item: TokenStream) -> TokenStream {
+    component::document_required_components(attr, item)
 }
 
 #[proc_macro_derive(States)]

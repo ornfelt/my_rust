@@ -343,7 +343,7 @@ impl AssetSourceBuilders {
     /// Builds a new [`AssetSources`] collection. If `watch` is true, the unprocessed sources will watch for changes.
     /// If `watch_processed` is true, the processed sources will watch for changes.
     pub fn build_sources(&mut self, watch: bool, watch_processed: bool) -> AssetSources {
-        let mut sources = HashMap::new();
+        let mut sources = <HashMap<_, _>>::default();
         for (id, source) in &mut self.sources {
             if let Some(data) = source.build(
                 AssetSourceId::Name(id.clone_owned()),
@@ -587,7 +587,7 @@ impl AssetSources {
             AssetSourceId::Name(name) => self
                 .sources
                 .get(&name)
-                .ok_or_else(|| MissingAssetSourceError(AssetSourceId::Name(name))),
+                .ok_or(MissingAssetSourceError(AssetSourceId::Name(name))),
         }
     }
 

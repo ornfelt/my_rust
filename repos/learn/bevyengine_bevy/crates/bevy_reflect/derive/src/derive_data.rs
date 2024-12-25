@@ -15,6 +15,7 @@ use crate::{
 use quote::{quote, ToTokens};
 use syn::token::Comma;
 
+use crate::generics::generate_generics;
 use syn::{
     parse_str, punctuated::Punctuated, spanned::Spanned, Data, DeriveInput, Field, Fields,
     GenericParam, Generics, Ident, LitStr, Meta, Path, PathSegment, Type, TypeParam, Variant,
@@ -276,12 +277,14 @@ impl<'a> ReflectDerive<'a> {
             return Ok(Self::Opaque(meta));
         }
 
-        return match &input.data {
+        match &input.data {
             Data::Struct(data) => {
                 let fields = Self::collect_struct_fields(&data.fields)?;
+                let serialization_data =
+                    SerializationDataDef::new(&fields, &meta.bevy_reflect_path)?;
                 let reflect_struct = ReflectStruct {
                     meta,
-                    serialization_data: SerializationDataDef::new(&fields)?,
+                    serialization_data,
                     fields,
                 };
 
@@ -301,7 +304,7 @@ impl<'a> ReflectDerive<'a> {
                 input.span(),
                 "reflection not supported for unions",
             )),
-        };
+        }
     }
 
     /// Set the remote type for this derived type.
@@ -627,19 +630,18 @@ impl<'a> ReflectStruct<'a> {
             .custom_attributes()
             .to_tokens(bevy_reflect_path);
 
-        #[cfg_attr(
-            not(feature = "documentation"),
-            expect(
-                unused_mut,
-                reason = "Needs to be mutable if `documentation` feature is enabled.",
-            )
-        )]
         let mut info = quote! {
             #bevy_reflect_path::#info_struct::new::<Self>(&[
                 #(#field_infos),*
             ])
             .with_custom_attributes(#custom_attributes)
         };
+
+        if let Some(generics) = generate_generics(self.meta()) {
+            info.extend(quote! {
+                .with_generics(#generics)
+            });
+        }
 
         #[cfg(feature = "documentation")]
         {
@@ -730,19 +732,18 @@ impl<'a> ReflectEnum<'a> {
             .custom_attributes()
             .to_tokens(bevy_reflect_path);
 
-        #[cfg_attr(
-            not(feature = "documentation"),
-            expect(
-                unused_mut,
-                reason = "Needs to be mutable if `documentation` feature is enabled.",
-            )
-        )]
         let mut info = quote! {
             #bevy_reflect_path::EnumInfo::new::<Self>(&[
                 #(#variants),*
             ])
             .with_custom_attributes(#custom_attributes)
         };
+
+        if let Some(generics) = generate_generics(self.meta()) {
+            info.extend(quote! {
+                .with_generics(#generics)
+            });
+        }
 
         #[cfg(feature = "documentation")]
         {
@@ -1002,7 +1003,7 @@ impl<'a> ReflectTypePath<'a> {
     ///
     /// Returns [`None`] if the type is [primitive] or [anonymous].
     ///
-    /// For non-customised [internal] paths this is created from [`module_path`].
+    /// For non-customized [internal] paths this is created from [`module_path`].
     ///
     /// For `Option<PhantomData>`, this is `"core"`.
     ///
@@ -1035,6 +1036,7 @@ impl<'a> ReflectTypePath<'a> {
     fn reduce_generics(
         generics: &Generics,
         mut ty_generic_fn: impl FnMut(&TypeParam) -> StringExpr,
+        bevy_reflect_path: &Path,
     ) -> StringExpr {
         let mut params = generics.params.iter().filter_map(|param| match param {
             GenericParam::Type(type_param) => Some(ty_generic_fn(type_param)),
@@ -1043,7 +1045,7 @@ impl<'a> ReflectTypePath<'a> {
                 let ty = &const_param.ty;
 
                 Some(StringExpr::Owned(quote! {
-                    <#ty as ::std::string::ToString>::to_string(&#ident)
+                    <#ty as #bevy_reflect_path::__macro_exports::alloc_utils::ToString>::to_string(&#ident)
                 }))
             }
             GenericParam::Lifetime(_) => None,
@@ -1075,6 +1077,7 @@ impl<'a> ReflectTypePath<'a> {
                                 <#ident as #bevy_reflect_path::TypePath>::type_path()
                             })
                         },
+                        bevy_reflect_path,
                     );
 
                     StringExpr::from_iter([
@@ -1112,6 +1115,7 @@ impl<'a> ReflectTypePath<'a> {
                                 <#ident as #bevy_reflect_path::TypePath>::short_type_path()
                             })
                         },
+                        bevy_reflect_path,
                     );
 
                     StringExpr::from_iter([
@@ -1132,7 +1136,7 @@ impl<'a> ReflectTypePath<'a> {
     ///
     /// Returns [`None`] if the type is [primitive] or [anonymous].
     ///
-    /// For non-customised [internal] paths this is created from [`module_path`].
+    /// For non-customized [internal] paths this is created from [`module_path`].
     ///
     /// For `Option<PhantomData>`, this is `"std::option"`.
     ///

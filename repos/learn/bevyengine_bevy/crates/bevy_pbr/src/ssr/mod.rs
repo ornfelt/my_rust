@@ -1,5 +1,7 @@
 //! Screen space reflections implemented via raymarching.
 
+#![expect(deprecated)]
+
 use bevy_app::{App, Plugin};
 use bevy_asset::{load_internal_asset, Handle};
 use bevy_core_pipeline::{
@@ -13,7 +15,7 @@ use bevy_core_pipeline::{
 use bevy_derive::{Deref, DerefMut};
 use bevy_ecs::{
     bundle::Bundle,
-    component::Component,
+    component::{require, Component},
     entity::Entity,
     query::{Has, QueryItem, With},
     reflect::ReflectComponent,
@@ -21,7 +23,9 @@ use bevy_ecs::{
     system::{lifetimeless::Read, Commands, Query, Res, ResMut, Resource},
     world::{FromWorld, World},
 };
+use bevy_image::BevyDefault as _;
 use bevy_reflect::{std_traits::ReflectDefault, Reflect};
+use bevy_render::render_graph::RenderGraph;
 use bevy_render::{
     extract_component::{ExtractComponent, ExtractComponentPlugin},
     render_graph::{NodeRunError, RenderGraphApp, RenderGraphContext, ViewNode, ViewNodeRunner},
@@ -33,8 +37,7 @@ use bevy_render::{
         ShaderStages, ShaderType, SpecializedRenderPipeline, SpecializedRenderPipelines,
         TextureFormat, TextureSampleType,
     },
-    renderer::{RenderContext, RenderDevice, RenderQueue},
-    texture::BevyDefault as _,
+    renderer::{RenderAdapter, RenderContext, RenderDevice, RenderQueue},
     view::{ExtractedView, Msaa, ViewTarget, ViewUniformOffset},
     Render, RenderApp, RenderSet,
 };
@@ -58,6 +61,10 @@ pub struct ScreenSpaceReflectionsPlugin;
 /// A convenient bundle to add screen space reflections to a camera, along with
 /// the depth and deferred prepasses required to enable them.
 #[derive(Bundle, Default)]
+#[deprecated(
+    since = "0.15.0",
+    note = "Use the `ScreenSpaceReflections` components instead. Inserting it will now also insert the other components required by it automatically."
+)]
 pub struct ScreenSpaceReflectionsBundle {
     /// The component that enables SSR.
     pub settings: ScreenSpaceReflections,
@@ -70,8 +77,8 @@ pub struct ScreenSpaceReflectionsBundle {
 /// Add this component to a camera to enable *screen-space reflections* (SSR).
 ///
 /// Screen-space reflections currently require deferred rendering in order to
-/// appear. Therefore, you'll generally need to add a [`DepthPrepass`] and a
-/// [`DeferredPrepass`] to the camera as well.
+/// appear. Therefore, they also need the [`DepthPrepass`] and [`DeferredPrepass`]
+/// components, which are inserted automatically.
 ///
 /// SSR currently performs no roughness filtering for glossy reflections, so
 /// only very smooth surfaces will reflect objects in screen space. You can
@@ -80,8 +87,8 @@ pub struct ScreenSpaceReflectionsBundle {
 ///
 /// As with all screen-space techniques, SSR can only reflect objects on screen.
 /// When objects leave the camera, they will disappear from reflections.
-/// Alternatives that don't suffer from this problem include
-/// [`crate::environment_map::ReflectionProbeBundle`]s. The advantage of SSR is
+/// An alternative that doesn't suffer from this problem is the combination of
+/// a [`LightProbe`](crate::LightProbe) and [`EnvironmentMapLight`]. The advantage of SSR is
 /// that it can reflect all objects, not just static ones.
 ///
 /// SSR is an approximation technique and produces artifacts in some situations.
@@ -92,6 +99,7 @@ pub struct ScreenSpaceReflectionsBundle {
 /// which is required for screen-space raymarching.
 #[derive(Clone, Copy, Component, Reflect)]
 #[reflect(Component, Default)]
+#[require(DepthPrepass, DeferredPrepass)]
 #[doc(alias = "Ssr")]
 pub struct ScreenSpaceReflections {
     /// The maximum PBR roughness level that will enable screen space
@@ -226,8 +234,19 @@ impl Plugin for ScreenSpaceReflectionsPlugin {
 
         render_app
             .init_resource::<ScreenSpaceReflectionsPipeline>()
-            .init_resource::<SpecializedRenderPipelines<ScreenSpaceReflectionsPipeline>>()
-            .add_render_graph_edges(
+            .init_resource::<SpecializedRenderPipelines<ScreenSpaceReflectionsPipeline>>();
+
+        // only reference the default deferred lighting pass
+        // if it has been added
+        let has_default_deferred_lighting_pass = render_app
+            .world_mut()
+            .resource_mut::<RenderGraph>()
+            .sub_graph(Core3d)
+            .get_node_state(NodePbr::DeferredLightingPass)
+            .is_ok();
+
+        if has_default_deferred_lighting_pass {
+            render_app.add_render_graph_edges(
                 Core3d,
                 (
                     NodePbr::DeferredLightingPass,
@@ -235,6 +254,12 @@ impl Plugin for ScreenSpaceReflectionsPlugin {
                     Node3d::MainOpaquePass,
                 ),
             );
+        } else {
+            render_app.add_render_graph_edges(
+                Core3d,
+                (NodePbr::ScreenSpaceReflections, Node3d::MainOpaquePass),
+            );
+        }
     }
 }
 
@@ -347,6 +372,7 @@ impl FromWorld for ScreenSpaceReflectionsPipeline {
     fn from_world(world: &mut World) -> Self {
         let mesh_view_layouts = world.resource::<MeshPipelineViewLayouts>().clone();
         let render_device = world.resource::<RenderDevice>();
+        let render_adapter = world.resource::<RenderAdapter>();
 
         // Create the bind group layout.
         let bind_group_layout = render_device.create_bind_group_layout(
@@ -397,7 +423,7 @@ impl FromWorld for ScreenSpaceReflectionsPipeline {
             depth_linear_sampler,
             depth_nearest_sampler,
             bind_group_layout,
-            binding_arrays_are_usable: binding_arrays_are_usable(render_device),
+            binding_arrays_are_usable: binding_arrays_are_usable(render_device, render_adapter),
         }
     }
 }
@@ -553,6 +579,7 @@ impl SpecializedRenderPipeline for ScreenSpaceReflectionsPipeline {
             primitive: default(),
             depth_stencil: None,
             multisample: default(),
+            zero_initialize_workgroup_memory: false,
         }
     }
 }

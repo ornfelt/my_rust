@@ -5,7 +5,7 @@ use crate::{
     system::{EntityCommands, Resource},
     world::{Command, World},
 };
-use alloc::borrow::Cow;
+use alloc::{borrow::Cow, boxed::Box};
 use bevy_reflect::{PartialReflect, TypeRegistry};
 use core::marker::PhantomData;
 
@@ -221,8 +221,9 @@ fn insert_reflect(
         .get_represented_type_info()
         .expect("component should represent a type.");
     let type_path = type_info.type_path();
-    let Some(mut entity) = world.get_entity_mut(entity) else {
-        panic!("error[B0003]: Could not insert a reflected component (of type {type_path}) for entity {entity:?} because it doesn't exist in this World. See: https://bevyengine.org/learn/errors/b0003");
+    let Ok(mut entity) = world.get_entity_mut(entity) else {
+        panic!("error[B0003]: Could not insert a reflected component (of type {type_path}) for entity {entity}, which {}. See: https://bevyengine.org/learn/errors/b0003",
+        world.entities().entity_does_not_exist_error_details_message(entity));
     };
     let Some(type_registration) = type_registry.get(type_info.type_id()) else {
         panic!("`{type_path}` should be registered in type registry via `App::register_type<{type_path}>`");
@@ -284,7 +285,7 @@ fn remove_reflect(
     type_registry: &TypeRegistry,
     component_type_path: Cow<'static, str>,
 ) {
-    let Some(mut entity) = world.get_entity_mut(entity) else {
+    let Ok(mut entity) = world.get_entity_mut(entity) else {
         return;
     };
     let Some(type_registration) = type_registry.get_with_type_path(&component_type_path) else {

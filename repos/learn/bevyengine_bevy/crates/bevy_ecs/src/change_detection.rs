@@ -544,7 +544,7 @@ impl<'w> From<TicksMut<'w>> for Ticks<'w> {
 /// If you need a unique mutable borrow, use [`ResMut`] instead.
 ///
 /// This [`SystemParam`](crate::system::SystemParam) fails validation if resource doesn't exist.
-/// This will cause systems that use this parameter to be skipped.
+/// This will cause a panic, but can be configured to do nothing or warn once.
 ///
 /// Use [`Option<Res<T>>`] instead if the resource might not always exist.
 pub struct Res<'w, T: ?Sized + Resource> {
@@ -622,7 +622,7 @@ impl_debug!(Res<'w, T>, Resource);
 /// If you need a shared borrow, use [`Res`] instead.
 ///
 /// This [`SystemParam`](crate::system::SystemParam) fails validation if resource doesn't exist.
-/// This will cause systems that use this parameter to be skipped.
+/// /// This will cause a panic, but can be configured to do nothing or warn once.
 ///
 /// Use [`Option<ResMut<T>>`] instead if the resource might not always exist.
 pub struct ResMut<'w, T: ?Sized + Resource> {
@@ -683,7 +683,7 @@ impl<'w, T: Resource> From<ResMut<'w, T>> for Mut<'w, T> {
 /// over to another thread.
 ///
 /// This [`SystemParam`](crate::system::SystemParam) fails validation if non-send resource doesn't exist.
-/// This will cause systems that use this parameter to be skipped.
+/// /// This will cause a panic, but can be configured to do nothing or warn once.
 ///
 /// Use [`Option<NonSendMut<T>>`] instead if the resource might not always exist.
 pub struct NonSendMut<'w, T: ?Sized + 'static> {
@@ -1206,7 +1206,7 @@ mod tests {
             Mut, NonSendMut, Ref, ResMut, TicksMut, CHECK_TICK_THRESHOLD, MAX_CHANGE_AGE,
         },
         component::{Component, ComponentTicks, Tick},
-        system::{IntoSystem, Query, System},
+        system::{IntoSystem, Single, System},
         world::World,
     };
 
@@ -1236,12 +1236,12 @@ mod tests {
 
     #[test]
     fn change_expiration() {
-        fn change_detected(query: Query<Ref<C>>) -> bool {
-            query.single().is_changed()
+        fn change_detected(query: Option<Single<Ref<C>>>) -> bool {
+            query.unwrap().is_changed()
         }
 
-        fn change_expired(query: Query<Ref<C>>) -> bool {
-            query.single().is_changed()
+        fn change_expired(query: Option<Single<Ref<C>>>) -> bool {
+            query.unwrap().is_changed()
         }
 
         let mut world = World::new();
