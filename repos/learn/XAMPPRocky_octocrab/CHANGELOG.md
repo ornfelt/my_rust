@@ -7,6 +7,53 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.42.1](https://github.com/XAMPPRocky/octocrab/compare/v0.42.0...v0.42.1) - 2024-11-22
+
+### Other
+
+- Secret scanning alert locations API  ([#735](https://github.com/XAMPPRocky/octocrab/pull/735))
+
+## [0.42.0](https://github.com/XAMPPRocky/octocrab/compare/v0.41.2...v0.42.0) - 2024-11-13
+
+### Added
+
+- added ssh_signing_keys ops ([#725](https://github.com/XAMPPRocky/octocrab/pull/725))
+
+### Other
+
+- Secrets and Code scanning alerts API ([#730](https://github.com/XAMPPRocky/octocrab/pull/730))
+- add support for custom executors ([#728](https://github.com/XAMPPRocky/octocrab/pull/728))
+- Fixup route in api/issues/update ([#732](https://github.com/XAMPPRocky/octocrab/pull/732))
+
+## [0.41.2](https://github.com/XAMPPRocky/octocrab/compare/v0.41.1...v0.41.2) - 2024-10-15
+
+### Fixed
+
+- Removed rustls hard-dependency ([#709](https://github.com/XAMPPRocky/octocrab/pull/709))
+- crate build issues with `stream` feature ([#711](https://github.com/XAMPPRocky/octocrab/pull/711))
+
+### Other
+
+- Update tower dependency from 0.4.13 to 0.5.1  ([#722](https://github.com/XAMPPRocky/octocrab/pull/722))
+- added user's social accounts operations (/user/social_accounts) ([#723](https://github.com/XAMPPRocky/octocrab/pull/723))
+- added auth.user's git_ssh_keys operations ([#719](https://github.com/XAMPPRocky/octocrab/pull/719))
+- Remove --verbose ([#716](https://github.com/XAMPPRocky/octocrab/pull/716))
+
+## [0.41.1](https://github.com/XAMPPRocky/octocrab/compare/v0.41.0...v0.41.1) - 2024-10-10
+
+### Fixed
+
+- don't capture backtraces by default ([#710](https://github.com/XAMPPRocky/octocrab/pull/710))
+
+### Other
+
+- added user's gpg_keys operations ([#717](https://github.com/XAMPPRocky/octocrab/pull/717))
+- Secrecy dependency update from 0.8.0 to 0.10.3 ([#718](https://github.com/XAMPPRocky/octocrab/pull/718))
+- Added handlers for Repo Dependabot API ([#714](https://github.com/XAMPPRocky/octocrab/pull/714))
+- [#552](https://github.com/XAMPPRocky/octocrab/pull/552) (emails, public_emails, visibility) ([#712](https://github.com/XAMPPRocky/octocrab/pull/712))
+- make some fields to public ([#708](https://github.com/XAMPPRocky/octocrab/pull/708))
+- Implement some style improvements ([#698](https://github.com/XAMPPRocky/octocrab/pull/698))
+
 ## [0.41.0](https://github.com/XAMPPRocky/octocrab/compare/v0.40.0...v0.41.0) - 2024-09-30
 
 ### Added

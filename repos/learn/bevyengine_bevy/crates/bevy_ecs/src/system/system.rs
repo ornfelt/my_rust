@@ -1,5 +1,5 @@
-use bevy_utils::tracing::warn;
 use core::fmt::Debug;
+use log::warn;
 use thiserror::Error;
 
 use crate::{
@@ -11,7 +11,7 @@ use crate::{
     world::{unsafe_world_cell::UnsafeWorldCell, DeferredWorld, World},
 };
 
-use alloc::borrow::Cow;
+use alloc::{borrow::Cow, boxed::Box, vec::Vec};
 use core::any::TypeId;
 
 use super::IntoSystem;
@@ -50,7 +50,7 @@ pub trait System: Send + Sync + 'static {
     /// Returns true if the system must be run exclusively.
     fn is_exclusive(&self) -> bool;
 
-    /// Returns true if system as deferred buffers
+    /// Returns true if system has deferred buffers.
     fn has_deferred(&self) -> bool;
 
     /// Runs the system with the given input in the world. Unlike [`System::run`], this function
@@ -106,7 +106,7 @@ pub trait System: Send + Sync + 'static {
     /// should provide their own safety mechanism to prevent undefined behavior.
     ///
     /// This method has to be called directly before [`System::run_unsafe`] with no other (relevant)
-    /// world mutations inbetween. Otherwise, while it won't lead to any undefined behavior,
+    /// world mutations in between. Otherwise, while it won't lead to any undefined behavior,
     /// the validity of the param may change.
     ///
     /// # Safety
@@ -117,7 +117,7 @@ pub trait System: Send + Sync + 'static {
     /// - The method [`System::update_archetype_component_access`] must be called at some
     ///   point before this one, with the same exact [`World`]. If [`System::update_archetype_component_access`]
     ///   panics (or otherwise does not return for any reason), this method must not be called.
-    unsafe fn validate_param_unsafe(&self, world: UnsafeWorldCell) -> bool;
+    unsafe fn validate_param_unsafe(&mut self, world: UnsafeWorldCell) -> bool;
 
     /// Safe version of [`System::validate_param_unsafe`].
     /// that runs on exclusive, single-threaded `world` pointer.
@@ -271,7 +271,7 @@ where
 /// let entity = world.run_system_once(|mut commands: Commands| {
 ///     commands.spawn_empty().id()
 /// }).unwrap();
-/// # assert!(world.get_entity(entity).is_some());
+/// # assert!(world.get_entity(entity).is_ok());
 /// ```
 ///
 /// ## Immediate Queries
@@ -322,14 +322,14 @@ pub trait RunSystemOnce: Sized {
     where
         T: IntoSystem<(), Out, Marker>,
     {
-        self.run_system_once_with((), system)
+        self.run_system_once_with(system, ())
     }
 
     /// Tries to run a system with given input and apply deferred parameters.
     fn run_system_once_with<T, In, Out, Marker>(
         self,
-        input: SystemIn<'_, T::System>,
         system: T,
+        input: SystemIn<'_, T::System>,
     ) -> Result<Out, RunSystemError>
     where
         T: IntoSystem<In, Out, Marker>,
@@ -339,8 +339,8 @@ pub trait RunSystemOnce: Sized {
 impl RunSystemOnce for &mut World {
     fn run_system_once_with<T, In, Out, Marker>(
         self,
-        input: SystemIn<'_, T::System>,
         system: T,
+        input: SystemIn<'_, T::System>,
     ) -> Result<Out, RunSystemError>
     where
         T: IntoSystem<In, Out, Marker>,
@@ -392,7 +392,7 @@ mod tests {
         }
 
         let mut world = World::default();
-        let n = world.run_system_once_with(1, system).unwrap();
+        let n = world.run_system_once_with(system, 1).unwrap();
         assert_eq!(n, 2);
         assert_eq!(world.resource::<T>().0, 1);
     }
@@ -450,7 +450,7 @@ mod tests {
 
         let mut world = World::default();
         // This fails because `T` has not been added to the world yet.
-        let result = world.run_system_once(system);
+        let result = world.run_system_once(system.param_warn_once());
 
         assert!(matches!(result, Err(RunSystemError::InvalidParams(_))));
     }

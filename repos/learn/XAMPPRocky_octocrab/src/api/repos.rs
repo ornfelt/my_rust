@@ -11,6 +11,7 @@ mod branches;
 mod collaborators;
 mod commits;
 mod contributors;
+mod dependabot;
 pub mod events;
 mod file;
 pub mod forks;
@@ -19,6 +20,7 @@ mod merges;
 mod pulls;
 pub mod release_assets;
 pub mod releases;
+mod secret_scanning_alerts;
 mod secrets;
 mod stargazers;
 mod status;
@@ -34,12 +36,14 @@ pub use branches::ListBranchesBuilder;
 pub use collaborators::ListCollaboratorsBuilder;
 pub use commits::ListCommitsBuilder;
 pub use contributors::ListContributorsBuilder;
+pub use dependabot::RepoDependabotAlertsHandler;
 pub use file::{DeleteFileBuilder, GetContentBuilder, UpdateFileBuilder};
 pub use generate::GenerateRepositoryBuilder;
 pub use merges::MergeBranchBuilder;
 pub use pulls::ListPullsBuilder;
 pub use release_assets::ReleaseAssetsHandler;
 pub use releases::ReleasesHandler;
+pub use secret_scanning_alerts::RepoSecretScanningAlertsHandler;
 pub use secrets::RepoSecretsHandler;
 pub use stargazers::ListStarGazersBuilder;
 pub use status::{CreateStatusBuilder, ListStatusesBuilder};
@@ -746,6 +750,16 @@ impl<'octo> RepoHandler<'octo> {
     /// Handle secrets on the repository
     pub fn secrets(&self) -> RepoSecretsHandler<'_> {
         RepoSecretsHandler::new(self)
+    }
+
+    /// Handle dependabot alerts on the repository
+    pub fn dependabot(&self) -> RepoDependabotAlertsHandler<'_> {
+        RepoDependabotAlertsHandler::new(self)
+    }
+
+    /// Handle secrets scanning alerts on the repository
+    pub fn secrets_scanning(&self) -> RepoSecretScanningAlertsHandler<'_> {
+        RepoSecretScanningAlertsHandler::new(self)
     }
 
     /// Creates a new Git commit object.

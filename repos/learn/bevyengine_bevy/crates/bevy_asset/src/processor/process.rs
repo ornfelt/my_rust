@@ -27,11 +27,11 @@ pub trait Process: Send + Sync + Sized + 'static {
     type OutputLoader: AssetLoader;
     /// Processes the asset stored on `context` in some way using the settings stored on `meta`. The results are written to `writer`. The
     /// final written processed asset is loadable using [`Process::OutputLoader`]. This load will use the returned [`AssetLoader::Settings`].
-    fn process<'a>(
-        &'a self,
-        context: &'a mut ProcessContext,
+    fn process(
+        &self,
+        context: &mut ProcessContext,
         meta: AssetMeta<(), Self>,
-        writer: &'a mut Writer,
+        writer: &mut Writer,
     ) -> impl ConditionalSendFuture<
         Output = Result<<Self::OutputLoader as AssetLoader>::Settings, ProcessError>,
     >;
@@ -133,13 +133,16 @@ pub enum ProcessError {
     #[error(transparent)]
     MissingAssetLoaderForTypeName(#[from] MissingAssetLoaderForTypeNameError),
     #[error("The processor '{0}' does not exist")]
+    #[from(ignore)]
     MissingProcessor(String),
     #[error("Encountered an AssetReader error for '{path}': {err}")]
+    #[from(ignore)]
     AssetReaderError {
         path: AssetPath<'static>,
         err: AssetReaderError,
     },
     #[error("Encountered an AssetWriter error for '{path}': {err}")]
+    #[from(ignore)]
     AssetWriterError {
         path: AssetPath<'static>,
         err: AssetWriterError,
@@ -151,6 +154,7 @@ pub enum ProcessError {
     #[error(transparent)]
     MissingProcessedAssetWriterError(#[from] MissingProcessedAssetWriterError),
     #[error("Failed to read asset metadata for {path}: {err}")]
+    #[from(ignore)]
     ReadAssetMetaError {
         path: AssetPath<'static>,
         err: AssetReaderError,
@@ -162,8 +166,10 @@ pub enum ProcessError {
     #[error("The wrong meta type was passed into a processor. This is probably an internal implementation error.")]
     WrongMetaType,
     #[error("Encountered an error while saving the asset: {0}")]
-    AssetSaveError(#[from] Box<dyn core::error::Error + Send + Sync + 'static>),
+    #[from(ignore)]
+    AssetSaveError(Box<dyn core::error::Error + Send + Sync + 'static>),
     #[error("Encountered an error while transforming the asset: {0}")]
+    #[from(ignore)]
     AssetTransformError(Box<dyn core::error::Error + Send + Sync + 'static>),
     #[error("Assets without extensions are not supported.")]
     ExtensionRequired,
@@ -179,11 +185,11 @@ where
         LoadTransformAndSaveSettings<Loader::Settings, Transformer::Settings, Saver::Settings>;
     type OutputLoader = Saver::OutputLoader;
 
-    async fn process<'a>(
-        &'a self,
-        context: &'a mut ProcessContext<'_>,
+    async fn process(
+        &self,
+        context: &mut ProcessContext<'_>,
         meta: AssetMeta<(), Self>,
-        writer: &'a mut Writer,
+        writer: &mut Writer,
     ) -> Result<<Self::OutputLoader as AssetLoader>::Settings, ProcessError> {
         let AssetAction::Process { settings, .. } = meta.asset else {
             return Err(ProcessError::WrongMetaType);
@@ -320,14 +326,7 @@ impl<'a> ProcessContext<'a> {
         let loader = server.get_asset_loader_with_type_name(loader_name).await?;
         let mut reader = SliceReader::new(self.asset_bytes);
         let loaded_asset = server
-            .load_with_meta_loader_and_reader(
-                self.path,
-                Box::new(meta),
-                &*loader,
-                &mut reader,
-                false,
-                true,
-            )
+            .load_with_meta_loader_and_reader(self.path, &meta, &*loader, &mut reader, false, true)
             .await?;
         for (path, full_hash) in &loaded_asset.loader_dependencies {
             self.new_processed_info

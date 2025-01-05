@@ -1,5 +1,4 @@
-// FIXME(15321): solve CI failures, then replace with `#![expect()]`.
-#![allow(missing_docs, reason = "Not all docs are written yet, see #3492.")]
+#![expect(missing_docs, reason = "Not all docs are written yet, see #3492.")]
 #![cfg_attr(docsrs, feature(doc_auto_cfg))]
 #![deny(unsafe_code)]
 #![doc(
@@ -34,6 +33,8 @@ mod light;
 mod light_probe;
 mod lightmap;
 mod material;
+mod material_bind_groups;
+mod mesh_material;
 mod parallax;
 mod pbr_material;
 mod prepass;
@@ -41,6 +42,8 @@ mod render;
 mod ssao;
 mod ssr;
 mod volumetric_fog;
+
+use crate::material_bind_groups::FallbackBindlessResources;
 
 use bevy_color::{Color, LinearRgba};
 use core::marker::PhantomData;
@@ -53,6 +56,7 @@ pub use light::*;
 pub use light_probe::*;
 pub use lightmap::*;
 pub use material::*;
+pub use mesh_material::*;
 pub use parallax::*;
 pub use pbr_material::*;
 pub use prepass::*;
@@ -68,6 +72,7 @@ pub use volumetric_fog::{
 /// The PBR prelude.
 ///
 /// This includes the most common types in this crate, re-exported for your convenience.
+#[expect(deprecated)]
 pub mod prelude {
     #[doc(hidden)]
     pub use crate::{
@@ -82,6 +87,7 @@ pub mod prelude {
             LightProbe,
         },
         material::{Material, MaterialPlugin},
+        mesh_material::MeshMaterial3d,
         parallax::ParallaxMappingMethod,
         pbr_material::StandardMaterial,
         ssao::ScreenSpaceAmbientOcclusionPlugin,
@@ -112,6 +118,7 @@ use bevy_app::prelude::*;
 use bevy_asset::{load_internal_asset, AssetApp, Assets, Handle};
 use bevy_core_pipeline::core_3d::graph::{Core3d, Node3d};
 use bevy_ecs::prelude::*;
+use bevy_image::Image;
 use bevy_render::{
     alpha::AlphaMode,
     camera::{
@@ -123,10 +130,12 @@ use bevy_render::{
     render_asset::prepare_assets,
     render_graph::RenderGraph,
     render_resource::Shader,
-    texture::{GpuImage, Image},
-    view::{check_visibility, VisibilitySystems},
+    sync_component::SyncComponentPlugin,
+    texture::GpuImage,
+    view::VisibilitySystems,
     ExtractSchedule, Render, RenderApp, RenderSet,
 };
+
 use bevy_transform::TransformSystem;
 
 pub const PBR_TYPES_SHADER_HANDLE: Handle<Shader> = Handle::weak_from_u128(1708015359337029744);
@@ -153,6 +162,9 @@ pub const PBR_DEFERRED_FUNCTIONS_HANDLE: Handle<Shader> = Handle::weak_from_u128
 pub const RGB9E5_FUNCTIONS_HANDLE: Handle<Shader> = Handle::weak_from_u128(2659010996143919192);
 const MESHLET_VISIBILITY_BUFFER_RESOLVE_SHADER_HANDLE: Handle<Shader> =
     Handle::weak_from_u128(2325134235233421);
+
+pub const TONEMAPPING_LUT_TEXTURE_BINDING_INDEX: u32 = 23;
+pub const TONEMAPPING_LUT_SAMPLER_BINDING_INDEX: u32 = 24;
 
 /// Sets up the entire PBR infrastructure of bevy.
 pub struct PbrPlugin {
@@ -307,7 +319,6 @@ impl Plugin for PbrPlugin {
             .register_type::<PointLight>()
             .register_type::<PointLightShadowMap>()
             .register_type::<SpotLight>()
-            .register_type::<DistanceFog>()
             .register_type::<ShadowFilteringMethod>()
             .init_resource::<AmbientLight>()
             .init_resource::<GlobalVisibleClusterableObjects>()
@@ -338,6 +349,11 @@ impl Plugin for PbrPlugin {
                 },
                 VolumetricFogPlugin,
                 ScreenSpaceReflectionsPlugin,
+            ))
+            .add_plugins((
+                SyncComponentPlugin::<DirectionalLight>::default(),
+                SyncComponentPlugin::<PointLight>::default(),
+                SyncComponentPlugin::<SpotLight>::default(),
             ))
             .configure_sets(
                 PostUpdate,
@@ -390,7 +406,6 @@ impl Plugin for PbrPlugin {
                         .in_set(SimulationLightSystems::UpdateLightFrusta)
                         .after(TransformSystem::TransformPropagate)
                         .after(SimulationLightSystems::AssignLightsToClusters),
-                    check_visibility::<WithLight>.in_set(VisibilitySystems::CheckVisibility),
                     (
                         check_dir_light_mesh_visibility,
                         check_point_light_mesh_visibility,
@@ -410,13 +425,13 @@ impl Plugin for PbrPlugin {
             app.add_plugins(DeferredPbrLightingPlugin);
         }
 
+        // Initialize the default material handle.
         app.world_mut()
             .resource_mut::<Assets<StandardMaterial>>()
             .insert(
                 &Handle::<StandardMaterial>::default(),
                 StandardMaterial {
                     base_color: Color::srgb(1.0, 0.0, 0.5),
-                    unlit: true,
                     ..Default::default()
                 },
             );
@@ -439,6 +454,12 @@ impl Plugin for PbrPlugin {
             )
             .init_resource::<LightMeta>();
 
+        render_app.world_mut().add_observer(add_light_view_entities);
+        render_app
+            .world_mut()
+            .add_observer(remove_light_view_entities);
+        render_app.world_mut().add_observer(extracted_light_removed);
+
         let shadow_pass_node = ShadowPassNode::new(render_app.world_mut());
         let mut graph = render_app.world_mut().resource_mut::<RenderGraph>();
         let draw_3d_graph = graph.get_sub_graph_mut(Core3d).unwrap();
@@ -454,7 +475,8 @@ impl Plugin for PbrPlugin {
         // Extract the required data from the main world
         render_app
             .init_resource::<ShadowSamplers>()
-            .init_resource::<GlobalClusterableObjectMeta>();
+            .init_resource::<GlobalClusterableObjectMeta>()
+            .init_resource::<FallbackBindlessResources>();
     }
 }
 

@@ -9,13 +9,15 @@ pub use parse::ParseError;
 use parse::PathParser;
 
 use crate::{PartialReflect, Reflect};
+use alloc::vec::Vec;
 use core::fmt;
+use derive_more::derive::From;
 use thiserror::Error;
 
 type PathResult<'a, T> = Result<T, ReflectPathError<'a>>;
 
 /// An error returned from a failed path string query.
-#[derive(Debug, PartialEq, Eq, Error)]
+#[derive(Error, Debug, PartialEq, Eq)]
 pub enum ReflectPathError<'a> {
     /// An error caused by trying to access a path that's not able to be accessed,
     /// see [`AccessError`] for details.
@@ -37,9 +39,10 @@ pub enum ReflectPathError<'a> {
         error: ParseError<'a>,
     },
 }
+
 impl<'a> From<AccessError<'a>> for ReflectPathError<'a> {
     fn from(value: AccessError<'a>) -> Self {
-        Self::InvalidAccess(value)
+        ReflectPathError::InvalidAccess(value)
     }
 }
 
@@ -355,7 +358,7 @@ impl From<Access<'static>> for OffsetAccess {
 /// ];
 /// let my_path = ParsedPath::from(path_elements);
 /// ```
-#[derive(Clone, Debug, PartialEq, PartialOrd, Ord, Eq, Hash)]
+#[derive(Clone, Debug, PartialEq, PartialOrd, Ord, Eq, Hash, From)]
 pub struct ParsedPath(
     /// This is a vector of pre-parsed [`OffsetAccess`]es.
     pub Vec<OffsetAccess>,
@@ -445,11 +448,6 @@ impl<'a> ReflectPath<'a> for &'a ParsedPath {
             root = access.element_mut(root, *offset)?;
         }
         Ok(root)
-    }
-}
-impl From<Vec<OffsetAccess>> for ParsedPath {
-    fn from(value: Vec<OffsetAccess>) -> Self {
-        ParsedPath(value)
     }
 }
 impl<const N: usize> From<[OffsetAccess; N]> for ParsedPath {

@@ -8,7 +8,8 @@ use bevy_ecs::{
     world::{Command, Mut, World},
 };
 use bevy_hierarchy::{AddChild, BuildChildren, DespawnRecursiveExt, Parent};
-use bevy_utils::{tracing::error, HashMap, HashSet};
+use bevy_reflect::Reflect;
+use bevy_utils::{HashMap, HashSet};
 use thiserror::Error;
 use uuid::Uuid;
 
@@ -17,7 +18,8 @@ use uuid::Uuid;
 /// See also [`Trigger`], [`SceneSpawner::instance_is_ready`].
 ///
 /// [`Trigger`]: bevy_ecs::observer::Trigger
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Event)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Event, Reflect)]
+#[reflect(Debug, PartialEq)]
 pub struct SceneInstanceReady {
     /// Instance which has been spawned.
     pub instance_id: InstanceId,
@@ -31,7 +33,8 @@ pub struct InstanceInfo {
 }
 
 /// Unique id identifying a scene instance.
-#[derive(Copy, Clone, Debug, Eq, PartialEq, Hash)]
+#[derive(Copy, Clone, Debug, Eq, PartialEq, Hash, Reflect)]
+#[reflect(Debug, PartialEq, Hash)]
 pub struct InstanceId(Uuid);
 
 impl InstanceId {
@@ -191,7 +194,7 @@ impl SceneSpawner {
     pub fn despawn_instance_sync(&mut self, world: &mut World, instance_id: &InstanceId) {
         if let Some(instance) = self.spawned_instances.remove(instance_id) {
             for &entity in instance.entity_map.values() {
-                if let Some(mut entity_mut) = world.get_entity_mut(entity) {
+                if let Ok(mut entity_mut) = world.get_entity_mut(entity) {
                     entity_mut.remove_parent();
                     entity_mut.despawn_recursive();
                 };
@@ -316,7 +319,7 @@ impl SceneSpawner {
                     let spawned = self
                         .spawned_dynamic_scenes
                         .entry(handle.id())
-                        .or_insert_with(HashSet::new);
+                        .or_insert_with(HashSet::default);
                     spawned.insert(instance_id);
 
                     // Scenes with parents need more setup before they are ready.
@@ -423,11 +426,11 @@ impl SceneSpawner {
 pub fn scene_spawner_system(world: &mut World) {
     world.resource_scope(|world, mut scene_spawner: Mut<SceneSpawner>| {
         // remove any loading instances where parent is deleted
-        let mut dead_instances = HashSet::default();
+        let mut dead_instances = <HashSet<_>>::default();
         scene_spawner
             .scenes_with_parent
             .retain(|(instance, parent)| {
-                let retain = world.get_entity(*parent).is_some();
+                let retain = world.get_entity(*parent).is_ok();
 
                 if !retain {
                     dead_instances.insert(*instance);
@@ -482,7 +485,7 @@ mod tests {
     };
     use bevy_reflect::Reflect;
 
-    use crate::{DynamicSceneBuilder, ScenePlugin};
+    use crate::{DynamicSceneBuilder, DynamicSceneRoot, ScenePlugin};
 
     use super::*;
 
@@ -581,7 +584,7 @@ mod tests {
 
     fn observe_trigger(app: &mut App, scene_id: InstanceId, scene_entity: Entity) {
         // Add observer
-        app.world_mut().observe(
+        app.world_mut().add_observer(
             move |trigger: Trigger<SceneInstanceReady>,
                   scene_spawner: Res<SceneSpawner>,
                   mut trigger_count: ResMut<TriggerCount>| {
@@ -591,7 +594,7 @@ mod tests {
                     "`SceneInstanceReady` contains the wrong `InstanceId`"
                 );
                 assert_eq!(
-                    trigger.entity(),
+                    trigger.target(),
                     scene_entity,
                     "`SceneInstanceReady` triggered on the wrong parent entity"
                 );
@@ -725,7 +728,8 @@ mod tests {
 
         // Spawn scene.
         for _ in 0..count {
-            app.world_mut().spawn((ComponentA, scene.clone()));
+            app.world_mut()
+                .spawn((ComponentA, DynamicSceneRoot(scene.clone())));
         }
 
         app.update();

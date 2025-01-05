@@ -5,17 +5,20 @@ use crate::{
     archetype::ArchetypeFlags,
     bundle::BundleInfo,
     change_detection::MAX_CHANGE_AGE,
-    entity::Entity,
+    entity::{ComponentCloneCtx, Entity},
+    query::DebugCheckedUnwrap,
     storage::{SparseSetIndex, SparseSets, Storages, Table, TableRow},
     system::{Local, Resource, SystemParam},
     world::{DeferredWorld, FromWorld, World},
 };
-use alloc::{borrow::Cow, sync::Arc};
+#[cfg(feature = "bevy_reflect")]
+use alloc::boxed::Box;
+use alloc::{borrow::Cow, format, vec::Vec};
 pub use bevy_ecs_macros::Component;
 use bevy_ptr::{OwningPtr, UnsafeCellDeref};
 #[cfg(feature = "bevy_reflect")]
 use bevy_reflect::Reflect;
-use bevy_utils::{HashMap, TypeIdMap};
+use bevy_utils::{HashMap, HashSet, TypeIdMap};
 #[cfg(feature = "track_change_detection")]
 use core::panic::Location;
 use core::{
@@ -26,6 +29,16 @@ use core::{
     marker::PhantomData,
     mem::needs_drop,
 };
+use disqualified::ShortName;
+use thiserror::Error;
+
+#[cfg(feature = "portable-atomic")]
+use portable_atomic_util::Arc;
+
+#[cfg(not(feature = "portable-atomic"))]
+use alloc::sync::Arc;
+
+pub use bevy_ecs_macros::require;
 
 /// A data type that can be used to store data for an [entity].
 ///
@@ -71,12 +84,18 @@ use core::{
 ///
 /// # Component and data access
 ///
+/// Components can be marked as immutable by adding the `#[component(immutable)]`
+/// attribute when using the derive macro.
+/// See the documentation for [`ComponentMutability`] for more details around this
+/// feature.
+///
 /// See the [`entity`] module level documentation to learn how to add or remove components from an entity.
 ///
 /// See the documentation for [`Query`] to learn how to access component data from a system.
 ///
 /// [`entity`]: crate::entity#usage
 /// [`Query`]: crate::system::Query
+/// [`ComponentMutability`]: crate::component::ComponentMutability
 ///
 /// # Choosing a storage type
 ///
@@ -144,25 +163,33 @@ use core::{
 /// assert_eq!(&C(0), world.entity(id).get::<C>().unwrap());
 /// ```
 ///
-/// You can also define a custom constructor:
+/// You can also define a custom constructor function or closure:
 ///
 /// ```
 /// # use bevy_ecs::prelude::*;
 /// #[derive(Component)]
-/// #[require(B(init_b))]
+/// #[require(C(init_c))]
 /// struct A;
 ///
 /// #[derive(Component, PartialEq, Eq, Debug)]
-/// struct B(usize);
+/// #[require(C(|| C(20)))]
+/// struct B;
 ///
-/// fn init_b() -> B {
-///     B(10)
+/// #[derive(Component, PartialEq, Eq, Debug)]
+/// struct C(usize);
+///
+/// fn init_c() -> C {
+///     C(10)
 /// }
 ///
 /// # let mut world = World::default();
-/// // This will implicitly also insert B with the init_b() constructor
+/// // This will implicitly also insert C with the init_c() constructor
 /// let id = world.spawn(A).id();
-/// assert_eq!(&B(10), world.entity(id).get::<B>().unwrap());
+/// assert_eq!(&C(10), world.entity(id).get::<C>().unwrap());
+///
+/// // This will implicitly also insert C with the `|| C(20)` constructor closure
+/// let id = world.spawn(B).id();
+/// assert_eq!(&C(20), world.entity(id).get::<C>().unwrap());
 /// ```
 ///
 /// Required components are _recursive_. This means, if a Required Component has required components,
@@ -200,23 +227,15 @@ use core::{
 /// struct X(usize);
 ///
 /// #[derive(Component, Default)]
-/// #[require(X(x1))]
+/// #[require(X(|| X(1)))]
 /// struct Y;
-///
-/// fn x1() -> X {
-///     X(1)
-/// }
 ///
 /// #[derive(Component)]
 /// #[require(
 ///     Y,
-///     X(x2),
+///     X(|| X(2)),
 /// )]
 /// struct Z;
-///
-/// fn x2() -> X {
-///     X(2)
-/// }
 ///
 /// # let mut world = World::default();
 /// // In this case, the x2 constructor is used for X
@@ -224,13 +243,55 @@ use core::{
 /// assert_eq!(2, world.entity(id).get::<X>().unwrap().0);
 /// ```
 ///
-/// In general, this shouldn't happen often, but when it does the algorithm is simple and predictable:
-/// 1. Use all of the constructors (including default constructors) directly defined in the spawned component's require list
-/// 2. In the order the requires are defined in `#[require()]`, recursively visit the require list of each of the components in the list (this is a depth Depth First Search). When a constructor is found, it will only be used if one has not already been found.
+/// In general, this shouldn't happen often, but when it does the algorithm for choosing the constructor from the tree is simple and predictable:
+/// 1. A constructor from a direct `#[require()]`, if one exists, is selected with priority.
+/// 2. Otherwise, perform a Depth First Search on the tree of requirements and select the first one found.
 ///
 /// From a user perspective, just think about this as the following:
 /// 1. Specifying a required component constructor for Foo directly on a spawned component Bar will result in that constructor being used (and overriding existing constructors lower in the inheritance tree). This is the classic "inheritance override" behavior people expect.
 /// 2. For cases where "multiple inheritance" results in constructor clashes, Components should be listed in "importance order". List a component earlier in the requirement list to initialize its inheritance tree earlier.
+///
+/// ## Registering required components at runtime
+///
+/// In most cases, required components should be registered using the `require` attribute as shown above.
+/// However, in some cases, it may be useful to register required components at runtime.
+///
+/// This can be done through [`World::register_required_components`] or  [`World::register_required_components_with`]
+/// for the [`Default`] and custom constructors respectively:
+///
+/// ```
+/// # use bevy_ecs::prelude::*;
+/// #[derive(Component)]
+/// struct A;
+///
+/// #[derive(Component, Default, PartialEq, Eq, Debug)]
+/// struct B(usize);
+///
+/// #[derive(Component, PartialEq, Eq, Debug)]
+/// struct C(u32);
+///
+/// # let mut world = World::default();
+/// // Register B as required by A and C as required by B.
+/// world.register_required_components::<A, B>();
+/// world.register_required_components_with::<B, C>(|| C(2));
+///
+/// // This will implicitly also insert B with its Default constructor
+/// // and C with the custom constructor defined by B.
+/// let id = world.spawn(A).id();
+/// assert_eq!(&B(0), world.entity(id).get::<B>().unwrap());
+/// assert_eq!(&C(2), world.entity(id).get::<C>().unwrap());
+/// ```
+///
+/// Similar rules as before apply to duplicate requires fer a given type at different levels
+/// of the inheritance tree. `A` requiring `C` directly would take precedence over indirectly
+/// requiring it through `A` requiring `B` and `B` requiring `C`.
+///
+/// Unlike with the `require` attribute, directly requiring the same component multiple times
+/// for the same component will result in a panic. This is done to prevent conflicting constructors
+/// and confusing ordering dependencies.
+///
+/// Note that requirements must currently be registered before the requiring component is inserted
+/// into the world for the first time. Registering requirements after this will lead to a panic.
 ///
 /// # Adding component's hooks
 ///
@@ -334,16 +395,89 @@ pub trait Component: Send + Sync + 'static {
     /// A constant indicating the storage type used for this component.
     const STORAGE_TYPE: StorageType;
 
+    /// A marker type to assist Bevy with determining if this component is
+    /// mutable, or immutable. Mutable components will have [`Component<Mutability = Mutable>`],
+    /// while immutable components will instead have [`Component<Mutability = Immutable>`].
+    ///
+    /// * For a component to be mutable, this type must be [`Mutable`].
+    /// * For a component to be immutable, this type must be [`Immutable`].
+    type Mutability: ComponentMutability;
+
     /// Called when registering this component, allowing mutable access to its [`ComponentHooks`].
     fn register_component_hooks(_hooks: &mut ComponentHooks) {}
 
     /// Registers required components.
     fn register_required_components(
+        _component_id: ComponentId,
         _components: &mut Components,
         _storages: &mut Storages,
         _required_components: &mut RequiredComponents,
+        _inheritance_depth: u16,
+        _recursion_check_stack: &mut Vec<ComponentId>,
     ) {
     }
+
+    /// Called when registering this component, allowing to override clone function (or disable cloning altogether) for this component.
+    ///
+    /// See [Handlers section of `EntityCloneBuilder`](crate::entity::EntityCloneBuilder#handlers) to understand how this affects handler priority.
+    fn get_component_clone_handler() -> ComponentCloneHandler {
+        ComponentCloneHandler::default_handler()
+    }
+}
+
+mod private {
+    pub trait Seal {}
+}
+
+/// The mutability option for a [`Component`]. This can either be:
+/// * [`Mutable`]
+/// * [`Immutable`]
+///
+/// This is controlled through either [`Component::Mutability`] or `#[component(immutable)]`
+/// when using the derive macro.
+///
+/// Immutable components are guaranteed to never have an exclusive reference,
+/// `&mut ...`, created while inserted onto an entity.
+/// In all other ways, they are identical to mutable components.
+/// This restriction allows hooks to observe all changes made to an immutable
+/// component, effectively turning the `OnInsert` and `OnReplace` hooks into a
+/// `OnMutate` hook.
+/// This is not practical for mutable components, as the runtime cost of invoking
+/// a hook for every exclusive reference created would be far too high.
+///
+/// # Examples
+///
+/// ```rust
+/// # use bevy_ecs::component::Component;
+/// #
+/// #[derive(Component)]
+/// #[component(immutable)]
+/// struct ImmutableFoo;
+/// ```
+pub trait ComponentMutability: private::Seal + 'static {
+    /// Boolean to indicate if this mutability setting implies a mutable or immutable
+    /// component.
+    const MUTABLE: bool;
+}
+
+/// Parameter indicating a [`Component`] is immutable.
+///
+/// See [`ComponentMutability`] for details.
+pub struct Immutable;
+
+impl private::Seal for Immutable {}
+impl ComponentMutability for Immutable {
+    const MUTABLE: bool = false;
+}
+
+/// Parameter indicating a [`Component`] is mutable.
+///
+/// See [`ComponentMutability`] for details.
+pub struct Mutable;
+
+impl private::Seal for Mutable {}
+impl ComponentMutability for Mutable {
+    const MUTABLE: bool = true;
 }
 
 /// The storage used for a specific component type.
@@ -441,7 +575,7 @@ impl ComponentHooks {
     /// Will panic if the component already has an `on_add` hook
     pub fn on_add(&mut self, hook: ComponentHook) -> &mut Self {
         self.try_on_add(hook)
-            .expect("Component id: {:?}, already has an on_add hook")
+            .expect("Component already has an on_add hook")
     }
 
     /// Register a [`ComponentHook`] that will be run when this component is added (with `.insert`)
@@ -459,7 +593,7 @@ impl ComponentHooks {
     /// Will panic if the component already has an `on_insert` hook
     pub fn on_insert(&mut self, hook: ComponentHook) -> &mut Self {
         self.try_on_insert(hook)
-            .expect("Component id: {:?}, already has an on_insert hook")
+            .expect("Component already has an on_insert hook")
     }
 
     /// Register a [`ComponentHook`] that will be run when this component is about to be dropped,
@@ -481,7 +615,7 @@ impl ComponentHooks {
     /// Will panic if the component already has an `on_replace` hook
     pub fn on_replace(&mut self, hook: ComponentHook) -> &mut Self {
         self.try_on_replace(hook)
-            .expect("Component id: {:?}, already has an on_replace hook")
+            .expect("Component already has an on_replace hook")
     }
 
     /// Register a [`ComponentHook`] that will be run when this component is removed from an entity.
@@ -492,7 +626,7 @@ impl ComponentHooks {
     /// Will panic if the component already has an `on_remove` hook
     pub fn on_remove(&mut self, hook: ComponentHook) -> &mut Self {
         self.try_on_remove(hook)
-            .expect("Component id: {:?}, already has an on_remove hook")
+            .expect("Component already has an on_remove hook")
     }
 
     /// Attempt to register a [`ComponentHook`] that will be run when this component is added to an entity.
@@ -555,6 +689,7 @@ pub struct ComponentInfo {
     descriptor: ComponentDescriptor,
     hooks: ComponentHooks,
     required_components: RequiredComponents,
+    required_by: HashSet<ComponentId>,
 }
 
 impl ComponentInfo {
@@ -568,6 +703,12 @@ impl ComponentInfo {
     #[inline]
     pub fn name(&self) -> &str {
         &self.descriptor.name
+    }
+
+    /// Returns `true` if the current component is mutable.
+    #[inline]
+    pub fn mutable(&self) -> bool {
+        self.descriptor.mutable
     }
 
     /// Returns the [`TypeId`] of the underlying component type.
@@ -615,6 +756,7 @@ impl ComponentInfo {
             descriptor,
             hooks: Default::default(),
             required_components: Default::default(),
+            required_by: Default::default(),
         }
     }
 
@@ -721,6 +863,7 @@ pub struct ComponentDescriptor {
     // this descriptor describes.
     // None if the underlying type doesn't need to be dropped
     drop: Option<for<'a> unsafe fn(OwningPtr<'a>)>,
+    mutable: bool,
 }
 
 // We need to ignore the `drop` field in our `Debug` impl
@@ -732,6 +875,7 @@ impl Debug for ComponentDescriptor {
             .field("is_send_and_sync", &self.is_send_and_sync)
             .field("type_id", &self.type_id)
             .field("layout", &self.layout)
+            .field("mutable", &self.mutable)
             .finish()
     }
 }
@@ -756,6 +900,7 @@ impl ComponentDescriptor {
             type_id: Some(TypeId::of::<T>()),
             layout: Layout::new::<T>(),
             drop: needs_drop::<T>().then_some(Self::drop_ptr::<T> as _),
+            mutable: T::Mutability::MUTABLE,
         }
     }
 
@@ -769,6 +914,7 @@ impl ComponentDescriptor {
         storage_type: StorageType,
         layout: Layout,
         drop: Option<for<'a> unsafe fn(OwningPtr<'a>)>,
+        mutable: bool,
     ) -> Self {
         Self {
             name: name.into(),
@@ -777,6 +923,7 @@ impl ComponentDescriptor {
             type_id: None,
             layout,
             drop,
+            mutable,
         }
     }
 
@@ -793,6 +940,7 @@ impl ComponentDescriptor {
             type_id: Some(TypeId::of::<T>()),
             layout: Layout::new::<T>(),
             drop: needs_drop::<T>().then_some(Self::drop_ptr::<T> as _),
+            mutable: true,
         }
     }
 
@@ -804,6 +952,7 @@ impl ComponentDescriptor {
             type_id: Some(TypeId::of::<T>()),
             layout: Layout::new::<T>(),
             drop: needs_drop::<T>().then_some(Self::drop_ptr::<T> as _),
+            mutable: true,
         }
     }
 
@@ -825,6 +974,118 @@ impl ComponentDescriptor {
     pub fn name(&self) -> &str {
         self.name.as_ref()
     }
+
+    /// Returns whether this component is mutable.
+    #[inline]
+    pub fn mutable(&self) -> bool {
+        self.mutable
+    }
+}
+
+/// Function type that can be used to clone an entity.
+pub type ComponentCloneFn = fn(&mut DeferredWorld, &mut ComponentCloneCtx);
+
+/// A struct instructing which clone handler to use when cloning a component.
+#[derive(Debug)]
+pub struct ComponentCloneHandler(Option<ComponentCloneFn>);
+
+impl ComponentCloneHandler {
+    /// Use the global default function to clone the component with this handler.
+    pub fn default_handler() -> Self {
+        Self(None)
+    }
+
+    /// Do not clone the component. When a command to clone an entity is issued, component with this handler will be skipped.
+    pub fn ignore() -> Self {
+        Self(Some(component_clone_ignore))
+    }
+
+    /// Set clone handler based on `Clone` trait.
+    ///
+    /// If set as a handler for a component that is not the same as the one used to create this handler, it will panic.
+    pub fn clone_handler<C: Component + Clone>() -> Self {
+        Self(Some(component_clone_via_clone::<C>))
+    }
+
+    /// Set clone handler based on `Reflect` trait.
+    #[cfg(feature = "bevy_reflect")]
+    pub fn reflect_handler() -> Self {
+        Self(Some(component_clone_via_reflect))
+    }
+
+    /// Set a custom handler for the component.
+    pub fn custom_handler(handler: ComponentCloneFn) -> Self {
+        Self(Some(handler))
+    }
+
+    /// Get [`ComponentCloneFn`] representing this handler or `None` if set to default handler.
+    pub fn get_handler(&self) -> Option<ComponentCloneFn> {
+        self.0
+    }
+}
+
+/// A registry of component clone handlers. Allows to set global default and per-component clone function for all components in the world.
+#[derive(Debug)]
+pub struct ComponentCloneHandlers {
+    handlers: Vec<Option<ComponentCloneFn>>,
+    default_handler: ComponentCloneFn,
+}
+
+impl ComponentCloneHandlers {
+    /// Sets the default handler for this registry. All components with [`default`](ComponentCloneHandler::default_handler) handler, as well as any component that does not have an
+    /// explicitly registered clone function will use this handler.
+    ///
+    /// See [Handlers section of `EntityCloneBuilder`](crate::entity::EntityCloneBuilder#handlers) to understand how this affects handler priority.
+    pub fn set_default_handler(&mut self, handler: ComponentCloneFn) {
+        self.default_handler = handler;
+    }
+
+    /// Returns the currently registered default handler.
+    pub fn get_default_handler(&self) -> ComponentCloneFn {
+        self.default_handler
+    }
+
+    /// Sets a handler for a specific component.
+    ///
+    /// See [Handlers section of `EntityCloneBuilder`](crate::entity::EntityCloneBuilder#handlers) to understand how this affects handler priority.
+    pub fn set_component_handler(&mut self, id: ComponentId, handler: ComponentCloneHandler) {
+        if id.0 >= self.handlers.len() {
+            self.handlers.resize(id.0 + 1, None);
+        }
+        self.handlers[id.0] = handler.0;
+    }
+
+    /// Checks if the specified component is registered. If not, the component will use the default global handler.
+    ///
+    /// This will return an incorrect result if `id` did not come from the same world as `self`.
+    pub fn is_handler_registered(&self, id: ComponentId) -> bool {
+        self.handlers.get(id.0).is_some_and(Option::is_some)
+    }
+
+    /// Gets a handler to clone a component. This can be one of the following:
+    /// - Custom clone function for this specific component.
+    /// - Default global handler.
+    /// - A [`component_clone_ignore`] (no cloning).
+    ///
+    /// This will return an incorrect result if `id` did not come from the same world as `self`.
+    pub fn get_handler(&self, id: ComponentId) -> ComponentCloneFn {
+        match self.handlers.get(id.0) {
+            Some(Some(handler)) => *handler,
+            Some(None) | None => self.default_handler,
+        }
+    }
+}
+
+impl Default for ComponentCloneHandlers {
+    fn default() -> Self {
+        Self {
+            handlers: Default::default(),
+            #[cfg(feature = "bevy_reflect")]
+            default_handler: component_clone_via_reflect,
+            #[cfg(not(feature = "bevy_reflect"))]
+            default_handler: component_clone_ignore,
+        }
+    }
 }
 
 /// Stores metadata associated with each kind of [`Component`] in a given [`World`].
@@ -833,10 +1094,11 @@ pub struct Components {
     components: Vec<ComponentInfo>,
     indices: TypeIdMap<ComponentId>,
     resource_indices: TypeIdMap<ComponentId>,
+    component_clone_handlers: ComponentCloneHandlers,
 }
 
 impl Components {
-    /// Registers a component of type `T` with this instance.
+    /// Registers a [`Component`] of type `T` with this instance.
     /// If a component of this type has already been registered, this will return
     /// the ID of the pre-existing component.
     ///
@@ -846,7 +1108,16 @@ impl Components {
     /// * [`Components::register_component_with_descriptor()`]
     #[inline]
     pub fn register_component<T: Component>(&mut self, storages: &mut Storages) -> ComponentId {
-        let mut registered = false;
+        self.register_component_internal::<T>(storages, &mut Vec::new())
+    }
+
+    #[inline]
+    fn register_component_internal<T: Component>(
+        &mut self,
+        storages: &mut Storages,
+        recursion_check_stack: &mut Vec<ComponentId>,
+    ) -> ComponentId {
+        let mut is_new_registration = false;
         let id = {
             let Components {
                 indices,
@@ -860,25 +1131,35 @@ impl Components {
                     storages,
                     ComponentDescriptor::new::<T>(),
                 );
-                registered = true;
+                is_new_registration = true;
                 id
             })
         };
-        if registered {
+        if is_new_registration {
             let mut required_components = RequiredComponents::default();
-            T::register_required_components(self, storages, &mut required_components);
+            T::register_required_components(
+                id,
+                self,
+                storages,
+                &mut required_components,
+                0,
+                recursion_check_stack,
+            );
             let info = &mut self.components[id.index()];
             T::register_component_hooks(&mut info.hooks);
             info.required_components = required_components;
+            let clone_handler = T::get_component_clone_handler();
+            self.component_clone_handlers
+                .set_component_handler(id, clone_handler);
         }
         id
     }
 
     /// Registers a component described by `descriptor`.
     ///
-    /// ## Note
+    /// # Note
     ///
-    /// If this method is called multiple times with identical descriptors, a distinct `ComponentId`
+    /// If this method is called multiple times with identical descriptors, a distinct [`ComponentId`]
     /// will be created for each one.
     ///
     /// # See also
@@ -950,6 +1231,296 @@ impl Components {
     #[inline]
     pub(crate) fn get_hooks_mut(&mut self, id: ComponentId) -> Option<&mut ComponentHooks> {
         self.components.get_mut(id.0).map(|info| &mut info.hooks)
+    }
+
+    #[inline]
+    pub(crate) fn get_required_components_mut(
+        &mut self,
+        id: ComponentId,
+    ) -> Option<&mut RequiredComponents> {
+        self.components
+            .get_mut(id.0)
+            .map(|info| &mut info.required_components)
+    }
+
+    /// Registers the given component `R` and [required components] inherited from it as required by `T`.
+    ///
+    /// When `T` is added to an entity, `R` will also be added if it was not already provided.
+    /// The given `constructor` will be used for the creation of `R`.
+    ///
+    /// [required components]: Component#required-components
+    ///
+    /// # Safety
+    ///
+    /// The given component IDs `required` and `requiree` must be valid.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`RequiredComponentsError`] if the `required` component is already a directly required component for the `requiree`.
+    ///
+    /// Indirect requirements through other components are allowed. In those cases, the more specific
+    /// registration will be used.
+    pub(crate) unsafe fn register_required_components<R: Component>(
+        &mut self,
+        requiree: ComponentId,
+        required: ComponentId,
+        constructor: fn() -> R,
+    ) -> Result<(), RequiredComponentsError> {
+        // SAFETY: The caller ensures that the `requiree` is valid.
+        let required_components = unsafe {
+            self.get_required_components_mut(requiree)
+                .debug_checked_unwrap()
+        };
+
+        // Cannot directly require the same component twice.
+        if required_components
+            .0
+            .get(&required)
+            .is_some_and(|c| c.inheritance_depth == 0)
+        {
+            return Err(RequiredComponentsError::DuplicateRegistration(
+                requiree, required,
+            ));
+        }
+
+        // Register the required component for the requiree.
+        // This is a direct requirement with a depth of `0`.
+        required_components.register_by_id(required, constructor, 0);
+
+        // Add the requiree to the list of components that require the required component.
+        // SAFETY: The component is in the list of required components, so it must exist already.
+        let required_by = unsafe { self.get_required_by_mut(required).debug_checked_unwrap() };
+        required_by.insert(requiree);
+
+        // SAFETY: The caller ensures that the `requiree` and `required` components are valid.
+        let inherited_requirements =
+            unsafe { self.register_inherited_required_components(requiree, required) };
+
+        // Propagate the new required components up the chain to all components that require the requiree.
+        if let Some(required_by) = self.get_required_by(requiree).cloned() {
+            // `required` is now required by anything that `requiree` was required by.
+            self.get_required_by_mut(required)
+                .unwrap()
+                .extend(required_by.iter().copied());
+            for &required_by_id in required_by.iter() {
+                // SAFETY: The component is in the list of required components, so it must exist already.
+                let required_components = unsafe {
+                    self.get_required_components_mut(required_by_id)
+                        .debug_checked_unwrap()
+                };
+
+                // Register the original required component in the "parent" of the requiree.
+                // The inheritance depth is 1 deeper than the `requiree` wrt `required_by_id`.
+                let depth = required_components.0.get(&requiree).expect("requiree is required by required_by_id, so its required_components must include requiree").inheritance_depth;
+                required_components.register_by_id(required, constructor, depth + 1);
+
+                for (component_id, component) in inherited_requirements.iter() {
+                    // Register the required component.
+                    // The inheritance depth of inherited components is whatever the requiree's
+                    // depth is relative to `required_by_id`, plus the inheritance depth of the
+                    // inherited component relative to the requiree, plus 1 to account for the
+                    // requiree in between.
+                    // SAFETY: Component ID and constructor match the ones on the original requiree.
+                    //         The original requiree is responsible for making sure the registration is safe.
+                    unsafe {
+                        required_components.register_dynamic(
+                            *component_id,
+                            component.constructor.clone(),
+                            component.inheritance_depth + depth + 1,
+                        );
+                    };
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Registers the components inherited from `required` for the given `requiree`,
+    /// returning the requirements in a list.
+    ///
+    /// # Safety
+    ///
+    /// The given component IDs `requiree` and `required` must be valid.
+    unsafe fn register_inherited_required_components(
+        &mut self,
+        requiree: ComponentId,
+        required: ComponentId,
+    ) -> Vec<(ComponentId, RequiredComponent)> {
+        // Get required components inherited from the `required` component.
+        // SAFETY: The caller ensures that the `required` component is valid.
+        let required_component_info = unsafe { self.get_info(required).debug_checked_unwrap() };
+        let inherited_requirements: Vec<(ComponentId, RequiredComponent)> = required_component_info
+            .required_components()
+            .0
+            .iter()
+            .map(|(component_id, required_component)| {
+                (
+                    *component_id,
+                    RequiredComponent {
+                        constructor: required_component.constructor.clone(),
+                        // Add `1` to the inheritance depth since this will be registered
+                        // for the component that requires `required`.
+                        inheritance_depth: required_component.inheritance_depth + 1,
+                    },
+                )
+            })
+            .collect();
+
+        // Register the new required components.
+        for (component_id, component) in inherited_requirements.iter().cloned() {
+            // SAFETY: The caller ensures that the `requiree` is valid.
+            let required_components = unsafe {
+                self.get_required_components_mut(requiree)
+                    .debug_checked_unwrap()
+            };
+
+            // Register the required component for the requiree.
+            // SAFETY: Component ID and constructor match the ones on the original requiree.
+            unsafe {
+                required_components.register_dynamic(
+                    component_id,
+                    component.constructor,
+                    component.inheritance_depth,
+                );
+            };
+
+            // Add the requiree to the list of components that require the required component.
+            // SAFETY: The caller ensures that the required components are valid.
+            let required_by = unsafe {
+                self.get_required_by_mut(component_id)
+                    .debug_checked_unwrap()
+            };
+            required_by.insert(requiree);
+        }
+
+        inherited_requirements
+    }
+
+    // NOTE: This should maybe be private, but it is currently public so that `bevy_ecs_macros` can use it.
+    //       We can't directly move this there either, because this uses `Components::get_required_by_mut`,
+    //       which is private, and could be equally risky to expose to users.
+    /// Registers the given component `R` and [required components] inherited from it as required by `T`,
+    /// and adds `T` to their lists of requirees.
+    ///
+    /// The given `inheritance_depth` determines how many levels of inheritance deep the requirement is.
+    /// A direct requirement has a depth of `0`, and each level of inheritance increases the depth by `1`.
+    /// Lower depths are more specific requirements, and can override existing less specific registrations.
+    ///
+    /// The `recursion_check_stack` allows checking whether this component tried to register itself as its
+    /// own (indirect) required component.
+    ///
+    /// This method does *not* register any components as required by components that require `T`.
+    ///
+    /// Only use this method if you know what you are doing. In most cases, you should instead use [`World::register_required_components`],
+    /// or the equivalent method in `bevy_app::App`.
+    ///
+    /// [required component]: Component#required-components
+    #[doc(hidden)]
+    pub fn register_required_components_manual<T: Component, R: Component>(
+        &mut self,
+        storages: &mut Storages,
+        required_components: &mut RequiredComponents,
+        constructor: fn() -> R,
+        inheritance_depth: u16,
+        recursion_check_stack: &mut Vec<ComponentId>,
+    ) {
+        let requiree = self.register_component_internal::<T>(storages, recursion_check_stack);
+        let required = self.register_component_internal::<R>(storages, recursion_check_stack);
+
+        // SAFETY: We just created the components.
+        unsafe {
+            self.register_required_components_manual_unchecked::<R>(
+                requiree,
+                required,
+                required_components,
+                constructor,
+                inheritance_depth,
+            );
+        }
+    }
+
+    /// Registers the given component `R` and [required components] inherited from it as required by `T`,
+    /// and adds `T` to their lists of requirees.
+    ///
+    /// The given `inheritance_depth` determines how many levels of inheritance deep the requirement is.
+    /// A direct requirement has a depth of `0`, and each level of inheritance increases the depth by `1`.
+    /// Lower depths are more specific requirements, and can override existing less specific registrations.
+    ///
+    /// This method does *not* register any components as required by components that require `T`.
+    ///
+    /// [required component]: Component#required-components
+    ///
+    /// # Safety
+    ///
+    /// The given component IDs `required` and `requiree` must be valid.
+    pub(crate) unsafe fn register_required_components_manual_unchecked<R: Component>(
+        &mut self,
+        requiree: ComponentId,
+        required: ComponentId,
+        required_components: &mut RequiredComponents,
+        constructor: fn() -> R,
+        inheritance_depth: u16,
+    ) {
+        // Components cannot require themselves.
+        if required == requiree {
+            return;
+        }
+
+        // Register the required component `R` for the requiree.
+        required_components.register_by_id(required, constructor, inheritance_depth);
+
+        // Add the requiree to the list of components that require `R`.
+        // SAFETY: The caller ensures that the component ID is valid.
+        //         Assuming it is valid, the component is in the list of required components, so it must exist already.
+        let required_by = unsafe { self.get_required_by_mut(required).debug_checked_unwrap() };
+        required_by.insert(requiree);
+
+        // Register the inherited required components for the requiree.
+        let required: Vec<(ComponentId, RequiredComponent)> = self
+            .get_info(required)
+            .unwrap()
+            .required_components()
+            .0
+            .iter()
+            .map(|(id, component)| (*id, component.clone()))
+            .collect();
+
+        for (id, component) in required {
+            // Register the inherited required components for the requiree.
+            // The inheritance depth is increased by `1` since this is a component required by the original required component.
+            required_components.register_dynamic(
+                id,
+                component.constructor.clone(),
+                component.inheritance_depth + 1,
+            );
+            self.get_required_by_mut(id).unwrap().insert(requiree);
+        }
+    }
+
+    #[inline]
+    pub(crate) fn get_required_by(&self, id: ComponentId) -> Option<&HashSet<ComponentId>> {
+        self.components.get(id.0).map(|info| &info.required_by)
+    }
+
+    #[inline]
+    pub(crate) fn get_required_by_mut(
+        &mut self,
+        id: ComponentId,
+    ) -> Option<&mut HashSet<ComponentId>> {
+        self.components
+            .get_mut(id.0)
+            .map(|info| &mut info.required_by)
+    }
+
+    /// Retrieves the [`ComponentCloneHandlers`]. Can be used to get clone functions for components.
+    pub fn get_component_clone_handlers(&self) -> &ComponentCloneHandlers {
+        &self.component_clone_handlers
+    }
+
+    /// Retrieves a mutable reference to the [`ComponentCloneHandlers`]. Can be used to set and update clone functions for components.
+    pub fn get_component_clone_handlers_mut(&mut self) -> &mut ComponentCloneHandlers {
+        &mut self.component_clone_handlers
     }
 
     /// Type-erased equivalent of [`Components::component_id()`].
@@ -1034,6 +1605,7 @@ impl Components {
     /// # See also
     ///
     /// * [`Components::resource_id()`]
+    /// * [`Components::register_resource_with_descriptor()`]
     #[inline]
     pub fn register_resource<T: Resource>(&mut self) -> ComponentId {
         // SAFETY: The [`ComponentDescriptor`] matches the [`TypeId`]
@@ -1042,6 +1614,24 @@ impl Components {
                 ComponentDescriptor::new_resource::<T>()
             })
         }
+    }
+
+    /// Registers a [`Resource`] described by `descriptor`.
+    ///
+    /// # Note
+    ///
+    /// If this method is called multiple times with identical descriptors, a distinct [`ComponentId`]
+    /// will be created for each one.
+    ///
+    /// # See also
+    ///
+    /// * [`Components::resource_id()`]
+    /// * [`Components::register_resource()`]
+    pub fn register_resource_with_descriptor(
+        &mut self,
+        descriptor: ComponentDescriptor,
+    ) -> ComponentId {
+        Components::register_resource_inner(&mut self.components, descriptor)
     }
 
     /// Registers a [non-send resource](crate::system::NonSend) of type `T` with this instance.
@@ -1069,10 +1659,18 @@ impl Components {
         let components = &mut self.components;
         *self.resource_indices.entry(type_id).or_insert_with(|| {
             let descriptor = func();
-            let component_id = ComponentId(components.len());
-            components.push(ComponentInfo::new(component_id, descriptor));
-            component_id
+            Components::register_resource_inner(components, descriptor)
         })
+    }
+
+    #[inline]
+    fn register_resource_inner(
+        components: &mut Vec<ComponentInfo>,
+        descriptor: ComponentDescriptor,
+    ) -> ComponentId {
+        let component_id = ComponentId(components.len());
+        components.push(ComponentInfo::new(component_id, descriptor));
+        component_id
     }
 
     /// Gets an iterator over all components registered with this instance.
@@ -1188,8 +1786,11 @@ impl<'a> TickCells<'a> {
 #[derive(Copy, Clone, Debug)]
 #[cfg_attr(feature = "bevy_reflect", derive(Reflect), reflect(Debug))]
 pub struct ComponentTicks {
-    pub(crate) added: Tick,
-    pub(crate) changed: Tick,
+    /// Tick recording the time this component or resource was added.
+    pub added: Tick,
+
+    /// Tick recording the time this component or resource was most recently changed.
+    pub changed: Tick,
 }
 
 impl ComponentTicks {
@@ -1207,19 +1808,8 @@ impl ComponentTicks {
         self.changed.is_newer_than(last_run, this_run)
     }
 
-    /// Returns the tick recording the time this component or resource was most recently changed.
-    #[inline]
-    pub fn last_changed_tick(&self) -> Tick {
-        self.changed
-    }
-
-    /// Returns the tick recording the time this component or resource was added.
-    #[inline]
-    pub fn added_tick(&self) -> Tick {
-        self.added
-    }
-
-    pub(crate) fn new(change_tick: Tick) -> Self {
+    /// Creates a new instance with the same change tick for `added` and `changed`.
+    pub fn new(change_tick: Tick) -> Self {
         Self {
             added: change_tick,
             changed: change_tick,
@@ -1298,6 +1888,18 @@ impl<T: Component> FromWorld for InitComponentId<T> {
     }
 }
 
+/// An error returned when the registration of a required component fails.
+#[derive(Error, Debug)]
+#[non_exhaustive]
+pub enum RequiredComponentsError {
+    /// The component is already a directly required component for the requiree.
+    #[error("Component {0:?} already directly requires component {1:?}")]
+    DuplicateRegistration(ComponentId, ComponentId),
+    /// An archetype with the component that requires other components already exists
+    #[error("An archetype with the component {0:?} that requires other components already exists")]
+    ArchetypeExists(ComponentId),
+}
+
 /// A Required Component constructor. See [`Component`] for details.
 #[cfg(feature = "track_change_detection")]
 #[derive(Clone)]
@@ -1343,11 +1945,30 @@ impl RequiredComponentConstructor {
     }
 }
 
+/// Metadata associated with a required component. See [`Component`] for details.
+#[derive(Clone)]
+pub struct RequiredComponent {
+    /// The constructor used for the required component.
+    pub constructor: RequiredComponentConstructor,
+
+    /// The depth of the component requirement in the requirement hierarchy for this component.
+    /// This is used for determining which constructor is used in cases where there are duplicate requires.
+    ///
+    /// For example, consider the inheritance tree `X -> Y -> Z`, where `->` indicates a requirement.
+    /// `X -> Y` and `Y -> Z` are direct requirements with a depth of 0, while `Z` is only indirectly
+    /// required for `X` with a depth of `1`.
+    ///
+    /// In cases where there are multiple conflicting requirements with the same depth, a higher priority
+    /// will be given to components listed earlier in the `require` attribute, or to the latest added requirement
+    /// if registered at runtime.
+    pub inheritance_depth: u16,
+}
+
 /// The collection of metadata for components that are required for a given component.
 ///
 /// For more information, see the "Required Components" section of [`Component`].
 #[derive(Default, Clone)]
-pub struct RequiredComponents(pub(crate) HashMap<ComponentId, RequiredComponentConstructor>);
+pub struct RequiredComponents(pub(crate) HashMap<ComponentId, RequiredComponent>);
 
 impl Debug for RequiredComponents {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
@@ -1358,8 +1979,10 @@ impl Debug for RequiredComponents {
 }
 
 impl RequiredComponents {
-    /// Registers a required component. If the component is already registered, the new registration
-    /// passed in the arguments will be ignored.
+    /// Registers a required component.
+    ///
+    /// If the component is already registered, it will be overwritten if the given inheritance depth
+    /// is smaller than the depth of the existing registration. Otherwise, the new registration will be ignored.
     ///
     /// # Safety
     ///
@@ -1371,54 +1994,117 @@ impl RequiredComponents {
         &mut self,
         component_id: ComponentId,
         constructor: RequiredComponentConstructor,
+        inheritance_depth: u16,
     ) {
-        self.0.entry(component_id).or_insert(constructor);
+        self.0
+            .entry(component_id)
+            .and_modify(|component| {
+                if component.inheritance_depth > inheritance_depth {
+                    // New registration is more specific than existing requirement
+                    component.constructor = constructor.clone();
+                    component.inheritance_depth = inheritance_depth;
+                }
+            })
+            .or_insert(RequiredComponent {
+                constructor,
+                inheritance_depth,
+            });
     }
 
-    /// Registers a required component. If the component is already registered, the new registration
-    /// passed in the arguments will be ignored.
+    /// Registers a required component.
+    ///
+    /// If the component is already registered, it will be overwritten if the given inheritance depth
+    /// is smaller than the depth of the existing registration. Otherwise, the new registration will be ignored.
     pub fn register<C: Component>(
         &mut self,
         components: &mut Components,
         storages: &mut Storages,
         constructor: fn() -> C,
+        inheritance_depth: u16,
     ) {
         let component_id = components.register_component::<C>(storages);
-        let erased: RequiredComponentConstructor = RequiredComponentConstructor(Arc::new(
-            move |table,
-                  sparse_sets,
-                  change_tick,
-                  table_row,
-                  entity,
-                  #[cfg(feature = "track_change_detection")] caller| {
-                OwningPtr::make(constructor(), |ptr| {
-                    // SAFETY: This will only be called in the context of `BundleInfo::write_components`, which will
-                    // pass in a valid table_row and entity requiring a C constructor
-                    // C::STORAGE_TYPE is the storage type associated with `component_id` / `C`
-                    // `ptr` points to valid `C` data, which matches the type associated with `component_id`
-                    unsafe {
-                        BundleInfo::initialize_required_component(
-                            table,
-                            sparse_sets,
-                            change_tick,
-                            table_row,
-                            entity,
-                            component_id,
-                            C::STORAGE_TYPE,
-                            ptr,
-                            #[cfg(feature = "track_change_detection")]
-                            caller,
-                        );
-                    }
-                });
-            },
-        ));
+        self.register_by_id(component_id, constructor, inheritance_depth);
+    }
+
+    /// Registers the [`Component`] with the given ID as required if it exists.
+    ///
+    /// If the component is already registered, it will be overwritten if the given inheritance depth
+    /// is smaller than the depth of the existing registration. Otherwise, the new registration will be ignored.
+    pub fn register_by_id<C: Component>(
+        &mut self,
+        component_id: ComponentId,
+        constructor: fn() -> C,
+        inheritance_depth: u16,
+    ) {
+        let erased: RequiredComponentConstructor = RequiredComponentConstructor({
+            // `portable-atomic-util` `Arc` is not able to coerce an unsized
+            // type like `std::sync::Arc` can. Creating a `Box` first does the
+            // coercion.
+            //
+            // This would be resolved by https://github.com/rust-lang/rust/issues/123430
+
+            #[cfg(feature = "portable-atomic")]
+            use alloc::boxed::Box;
+
+            #[cfg(feature = "track_change_detection")]
+            type Constructor = dyn for<'a, 'b> Fn(
+                &'a mut Table,
+                &'b mut SparseSets,
+                Tick,
+                TableRow,
+                Entity,
+                &'static Location<'static>,
+            );
+
+            #[cfg(not(feature = "track_change_detection"))]
+            type Constructor =
+                dyn for<'a, 'b> Fn(&'a mut Table, &'b mut SparseSets, Tick, TableRow, Entity);
+
+            #[cfg(feature = "portable-atomic")]
+            type Intermediate<T> = Box<T>;
+
+            #[cfg(not(feature = "portable-atomic"))]
+            type Intermediate<T> = Arc<T>;
+
+            let boxed: Intermediate<Constructor> = Intermediate::new(
+                move |table,
+                      sparse_sets,
+                      change_tick,
+                      table_row,
+                      entity,
+                      #[cfg(feature = "track_change_detection")] caller| {
+                    OwningPtr::make(constructor(), |ptr| {
+                        // SAFETY: This will only be called in the context of `BundleInfo::write_components`, which will
+                        // pass in a valid table_row and entity requiring a C constructor
+                        // C::STORAGE_TYPE is the storage type associated with `component_id` / `C`
+                        // `ptr` points to valid `C` data, which matches the type associated with `component_id`
+                        unsafe {
+                            BundleInfo::initialize_required_component(
+                                table,
+                                sparse_sets,
+                                change_tick,
+                                table_row,
+                                entity,
+                                component_id,
+                                C::STORAGE_TYPE,
+                                ptr,
+                                #[cfg(feature = "track_change_detection")]
+                                caller,
+                            );
+                        }
+                    });
+                },
+            );
+
+            Arc::from(boxed)
+        });
+
         // SAFETY:
         // `component_id` matches the type initialized by the `erased` constructor above.
         // `erased` initializes a component for `component_id` in such a way that
         // matches the storage type of the component. It only uses the given `table_row` or `Entity` to
         // initialize the storage corresponding to the given entity.
-        unsafe { self.register_dynamic(component_id, erased) };
+        unsafe { self.register_dynamic(component_id, erased, inheritance_depth) };
     }
 
     /// Iterates the ids of all required components. This includes recursive required components.
@@ -1442,5 +2128,168 @@ impl RequiredComponents {
         for (id, constructor) in &required_components.0 {
             self.0.entry(*id).or_insert_with(|| constructor.clone());
         }
+    }
+}
+
+// NOTE: This should maybe be private, but it is currently public so that `bevy_ecs_macros` can use it.
+// This exists as a standalone function instead of being inlined into the component derive macro so as
+// to reduce the amount of generated code.
+#[doc(hidden)]
+pub fn enforce_no_required_components_recursion(
+    components: &Components,
+    recursion_check_stack: &[ComponentId],
+) {
+    if let Some((&requiree, check)) = recursion_check_stack.split_last() {
+        if let Some(direct_recursion) = check
+            .iter()
+            .position(|&id| id == requiree)
+            .map(|index| index == check.len() - 1)
+        {
+            panic!(
+                "Recursive required components detected: {}\nhelp: {}",
+                recursion_check_stack
+                    .iter()
+                    .map(|id| format!("{}", ShortName(components.get_name(*id).unwrap())))
+                    .collect::<Vec<_>>()
+                    .join(" → "),
+                if direct_recursion {
+                    format!(
+                        "Remove require({})",
+                        ShortName(components.get_name(requiree).unwrap())
+                    )
+                } else {
+                    "If this is intentional, consider merging the components.".into()
+                }
+            );
+        }
+    }
+}
+
+/// Component [clone handler function](ComponentCloneFn) implemented using the [`Clone`] trait.
+/// Can be [set](ComponentCloneHandlers::set_component_handler) as clone handler for the specific component it is implemented for.
+/// It will panic if set as handler for any other component.
+///
+/// See [`ComponentCloneHandlers`] for more details.
+pub fn component_clone_via_clone<C: Clone + Component>(
+    _world: &mut DeferredWorld,
+    ctx: &mut ComponentCloneCtx,
+) {
+    if let Some(component) = ctx.read_source_component::<C>() {
+        ctx.write_target_component(component.clone());
+    }
+}
+
+/// Component [clone handler function](ComponentCloneFn) implemented using reflect.
+/// Can be [set](ComponentCloneHandlers::set_component_handler) as clone handler for any registered component,
+/// but only reflected components will be cloned.
+///
+/// To clone a component using this handler, the following must be true:
+/// - World has [`AppTypeRegistry`](crate::reflect::AppTypeRegistry)
+/// - Component has [`TypeId`]
+/// - Component is registered
+/// - Component has [`ReflectFromPtr`](bevy_reflect::ReflectFromPtr) registered
+/// - Component has one of the following registered: [`ReflectFromReflect`](bevy_reflect::ReflectFromReflect),
+///   [`ReflectDefault`](bevy_reflect::std_traits::ReflectDefault), [`ReflectFromWorld`](crate::reflect::ReflectFromWorld)
+///   
+/// If any of the conditions is not satisfied, the component will be skipped.
+///
+/// See [`EntityCloneBuilder`](crate::entity::EntityCloneBuilder) for details.
+#[cfg(feature = "bevy_reflect")]
+pub fn component_clone_via_reflect(world: &mut DeferredWorld, ctx: &mut ComponentCloneCtx) {
+    let Some(registry) = ctx.type_registry() else {
+        return;
+    };
+    let Some(source_component_reflect) = ctx.read_source_component_reflect() else {
+        return;
+    };
+    let component_info = ctx.component_info();
+    // checked in read_source_component_reflect
+    let type_id = component_info.type_id().unwrap();
+    let registry = registry.read();
+
+    // Try to clone using ReflectFromReflect
+    if let Some(reflect_from_reflect) =
+        registry.get_type_data::<bevy_reflect::ReflectFromReflect>(type_id)
+    {
+        if let Some(component) =
+            reflect_from_reflect.from_reflect(source_component_reflect.as_partial_reflect())
+        {
+            drop(registry);
+            ctx.write_target_component_reflect(component);
+            return;
+        }
+    }
+    // Else, try to clone using ReflectDefault
+    if let Some(reflect_default) =
+        registry.get_type_data::<bevy_reflect::std_traits::ReflectDefault>(type_id)
+    {
+        let mut component = reflect_default.default();
+        component.apply(source_component_reflect.as_partial_reflect());
+        drop(registry);
+        ctx.write_target_component_reflect(component);
+        return;
+    }
+    // Otherwise, try to clone using ReflectFromWorld
+    if let Some(reflect_from_world) =
+        registry.get_type_data::<crate::reflect::ReflectFromWorld>(type_id)
+    {
+        let reflect_from_world = reflect_from_world.clone();
+        let source_component_cloned = source_component_reflect.clone_value();
+        let component_layout = component_info.layout();
+        let target = ctx.target();
+        let component_id = ctx.component_id();
+        world.commands().queue(move |world: &mut World| {
+            let mut component = reflect_from_world.from_world(world);
+            assert_eq!(type_id, (*component).type_id());
+            component.apply(source_component_cloned.as_partial_reflect());
+            // SAFETY:
+            // - component_id is from the same world as target entity
+            // - component is a valid value represented by component_id
+            unsafe {
+                let raw_component_ptr =
+                    core::ptr::NonNull::new_unchecked(Box::into_raw(component).cast::<u8>());
+                world
+                    .entity_mut(target)
+                    .insert_by_id(component_id, OwningPtr::new(raw_component_ptr));
+                alloc::alloc::dealloc(raw_component_ptr.as_ptr(), component_layout);
+            }
+        });
+    }
+}
+
+/// Noop implementation of component clone handler function.
+///
+/// See [`EntityCloneBuilder`](crate::entity::EntityCloneBuilder) for details.
+pub fn component_clone_ignore(_world: &mut DeferredWorld, _ctx: &mut ComponentCloneCtx) {}
+
+/// Wrapper for components clone specialization using autoderef.
+#[doc(hidden)]
+pub struct ComponentCloneSpecializationWrapper<T>(PhantomData<T>);
+
+impl<T> Default for ComponentCloneSpecializationWrapper<T> {
+    fn default() -> Self {
+        Self(PhantomData)
+    }
+}
+
+/// Base trait for components clone specialization using autoderef.
+#[doc(hidden)]
+pub trait ComponentCloneBase {
+    fn get_component_clone_handler(&self) -> ComponentCloneHandler;
+}
+impl<C: Component> ComponentCloneBase for ComponentCloneSpecializationWrapper<C> {
+    fn get_component_clone_handler(&self) -> ComponentCloneHandler {
+        ComponentCloneHandler::default_handler()
+    }
+}
+
+/// Specialized trait for components clone specialization using autoderef.
+#[doc(hidden)]
+pub trait ComponentCloneViaClone {
+    fn get_component_clone_handler(&self) -> ComponentCloneHandler;
+}
+impl<C: Clone + Component> ComponentCloneViaClone for &ComponentCloneSpecializationWrapper<C> {
+    fn get_component_clone_handler(&self) -> ComponentCloneHandler {
+        ComponentCloneHandler::clone_handler::<C>()
     }
 }
