@@ -1,9 +1,0 @@
-[package]
-name = "glfw_gl"
-version = "0.1.0"
-edition = "2021"
-
-[dependencies]
-gl               = "0.14"   # OpenGL loader
-glfw             = "0.54"   # window / input
-rand             = "0.8"    # for obstacle wander
